@@ -1,0 +1,55 @@
+{# Render an HTMX-enabled table with paginator #}
+{% load helpers %}
+{% load i18n %}
+{% load buttons %}
+{% load render_table from django_tables2 %}
+
+<div class="htmx-container table-responsive">
+  {% with preferences|get_key:"pagination.placement" as paginator_placement %}
+    {% if paginator_placement == 'top' or paginator_placement == 'both' %}
+      {% include 'inc/paginator.html' with htmx=True table=table paginator=table.paginator page=table.page placement='top' %}
+    {% endif %}
+    {% render_table table 'inc/table_htmx.html' %}
+    {% if paginator_placement != 'top' %}
+      {% include 'inc/paginator.html' with htmx=True table=table paginator=table.paginator page=table.page %}
+    {% endif %}
+  {% endwith %}
+</div>
+
+{% if request.htmx %}
+  {# Include the updated object count for display elsewhere on the page #}
+  {% if not table.embedded %}
+    <div hx-swap-oob="innerHTML:.total-object-count">{{ table.rows|length }}</div>
+  {% endif %}
+
+  {# Announce the updated result count to assistive technology #}
+  {% if not table.embedded %}
+    <div hx-swap-oob="innerHTML:#object-list-status">
+      {% blocktrans trimmed count count=table.page.paginator.count %}
+        {{ count }} result found
+      {% plural %}
+        {{ count }} results found
+      {% endblocktrans %}
+    </div>
+  {% endif %}
+
+  {# Include the updated "save" link for the table configuration #}
+  {% if table.config_params and not table.embedded %}
+    <a class="dropdown-item" hx-swap-oob="outerHTML:#table_save_link" href="{% url 'extras:tableconfig_add' %}?{{ table.config_params }}&return_url={{ request.path }}" id="table_save_link">{% trans "Save" %}</a>
+  {% endif %}
+
+  {# Update the bulk action buttons with new query parameters #}
+  {% if actions and not table.embedded %}
+    {% action_buttons actions model multi=True as bulk_actions %}
+    {% if bulk_actions %}
+      <div class="btn-list bulk-action-buttons" hx-swap-oob="outerHTML:.bulk-action-buttons">
+        {{ bulk_actions }}
+      </div>
+    {% endif %}
+  {% endif %}
+
+  {# Update the return_url to reflect any changed query parameters (e.g. per_page) #}
+  {% if not table.embedded %}
+    <input type="hidden" id="object-list-return-url" name="return_url" value="{{ request.get_full_path }}" hx-swap-oob="outerHTML:#object-list-return-url" />
+  {% endif %}
+{% endif %}

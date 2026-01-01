@@ -1,0 +1,921 @@
+import uuid
+
+from django.test import RequestFactory, override_settings
+from django.urls import reverse
+
+from core.exceptions import JobFailed
+from core.models import Job, ObjectType
+from netbox.jobs import AsyncAPIJob
+from users.constants import TOKEN_DEFAULT_LENGTH
+from users.models import Group, ObjectPermission, Owner, OwnerGroup, Token, User
+from utilities.data import deepmerge
+from utilities.request import copy_safe_request
+from utilities.testing import APITestCase, APIViewTestCases, create_test_user
+
+
+class AppTestCase(APITestCase):
+
+    def test_root(self):
+
+        url = reverse('users-api:api-root')
+        response = self.client.get(f'{url}?format=api', **self.header)
+        self.assertEqual(response.status_code, 200)
+
+
+class UserTestCase(APIViewTestCases.APIViewTestCase):
+    model = User
+    brief_fields = ['display', 'id', 'url', 'username']
+    validation_excluded_fields = ['password']
+    bulk_update_data = {
+        'email': 'test@example.com',
+    }
+    bulk_update_invalid_data = {
+        'email': 'not-an-email',
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+
+        permissions = (
+            ObjectPermission(name='Permission 1', actions=['view']),
+            ObjectPermission(name='Permission 2', actions=['view']),
+            ObjectPermission(name='Permission 3', actions=['view']),
+        )
+        ObjectPermission.objects.bulk_create(permissions)
+        permissions[0].object_types.add(ObjectType.objects.get_by_natural_key('dcim', 'site'))
+        permissions[1].object_types.add(ObjectType.objects.get_by_natural_key('dcim', 'location'))
+        permissions[2].object_types.add(ObjectType.objects.get_by_natural_key('dcim', 'rack'))
+
+        users = (
+            User(username='user1', password='FooBarFooBar1'),
+            User(username='user2', password='FooBarFooBar2'),
+            User(username='user3', password='FooBarFooBar3'),
+        )
+        User.objects.bulk_create(users)
+
+        cls.create_data = [
+            {
+                'username': 'user4',
+                'password': 'FooBarFooBar4',
+                'permissions': [permissions[0].pk],
+            },
+            {
+                'username': 'user5',
+                'password': 'FooBarFooBar5',
+                'permissions': [permissions[1].pk],
+            },
+            {
+                'username': 'user6',
+                'password': 'FooBarFooBar6',
+                'permissions': [permissions[2].pk],
+            },
+        ]
+
+    def test_that_password_is_changed(self):
+        """
+        Test that password is changed
+        """
+
+        obj_perm = ObjectPermission(
+            name='Test permission',
+            actions=['change']
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(self.model))
+
+        user_credentials = {
+            'username': 'newuser',
+            'password': 'abc123FOO',
+        }
+        user = User.objects.create_user(**user_credentials)
+
+        data = {
+            'password': 'FooBarFooBar1'
+        }
+        url = reverse('users-api:user-detail', kwargs={'pk': user.id})
+        response = self.client.patch(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 200)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password(data['password']))
+
+    @override_settings(AUTH_PASSWORD_VALIDATORS=[{
+        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+        'OPTIONS': {'min_length': 8}
+    }])
+    def test_password_validation_enforced(self):
+        """
+        Test that any configured password validation rules (AUTH_PASSWORD_VALIDATORS) are enforced.
+        """
+        self.add_permissions('users.add_user')
+
+        data = {
+            'username': 'new_user',
+            'password': 'f1A',
+        }
+        url = reverse('users-api:user-list')
+
+        # Password too short
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 400)
+
+        # Password long enough
+        data['password'] = 'FooBar123'
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 201)
+
+        # Password no number
+        data['password'] = 'foobarFoo'
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 400)
+
+        # Password no letter
+        data['password'] = '123456789012'
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 400)
+
+        # Password no uppercase
+        data['password'] = 'foobarfoo1'
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 400)
+
+        # Password no lowercase
+        data['password'] = 'FOOBARFOO1'
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 400)
+
+
+class GroupTestCase(APIViewTestCases.APIViewTestCase):
+    model = Group
+    brief_fields = ['description', 'display', 'id', 'name', 'url']
+
+    @classmethod
+    def setUpTestData(cls):
+
+        permissions = (
+            ObjectPermission(name='Permission 1', actions=['view']),
+            ObjectPermission(name='Permission 2', actions=['view']),
+            ObjectPermission(name='Permission 3', actions=['view']),
+        )
+        ObjectPermission.objects.bulk_create(permissions)
+        permissions[0].object_types.add(ObjectType.objects.get_by_natural_key('dcim', 'site'))
+        permissions[1].object_types.add(ObjectType.objects.get_by_natural_key('dcim', 'location'))
+        permissions[2].object_types.add(ObjectType.objects.get_by_natural_key('dcim', 'rack'))
+
+        groups = (
+            Group(name='Group 1'),
+            Group(name='Group 2'),
+            Group(name='Group 3'),
+        )
+        Group.objects.bulk_create(groups)
+
+        cls.create_data = [
+            {
+                'name': 'Group 4',
+                'permissions': [permissions[0].pk],
+            },
+            {
+                'name': 'Group 5',
+                'permissions': [permissions[1].pk],
+            },
+            {
+                'name': 'Group 6',
+                'permissions': [permissions[2].pk],
+            },
+        ]
+
+    def model_to_dict(self, instance, *args, **kwargs):
+        # Overwrite permissions attr to work around the serializer field having a different name
+        data = super().model_to_dict(instance, *args, **kwargs)
+        data['permissions'] = list(instance.object_permissions.values_list('id', flat=True))
+        return data
+
+    def test_bulk_update_objects(self):
+        """
+        Disabled test. There's no attribute we can set in bulk for Groups.
+        """
+        return
+
+
+class TokenTestCase(
+    # No GraphQL support for Token
+    APIViewTestCases.GetObjectViewTestCase,
+    APIViewTestCases.ListObjectsViewTestCase,
+    APIViewTestCases.CreateObjectViewTestCase,
+    APIViewTestCases.UpdateObjectViewTestCase,
+    APIViewTestCases.DeleteObjectViewTestCase,
+):
+    model = Token
+    brief_fields = ['description', 'display', 'enabled', 'id', 'key', 'url', 'version', 'write_enabled']
+    bulk_update_data = {
+        'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'expires': 'not-a-date',
+    }
+
+    def setUp(self):
+        super().setUp()
+
+        # Apply grant_token permission to enable the creation of Tokens for other Users
+        self.add_permissions('users.grant_token')
+
+    @classmethod
+    def setUpTestData(cls):
+        users = (
+            create_test_user('User 1'),
+            create_test_user('User 2'),
+            create_test_user('User 3'),
+        )
+
+        tokens = (
+            Token(user=users[0]),
+            Token(user=users[1]),
+            Token(user=users[2]),
+        )
+        # Use save() instead of bulk_create() to ensure keys get automatically generated
+        for token in tokens:
+            token.save()
+
+        cls.create_data = [
+            {
+                'user': users[0].pk,
+                'enabled': True,
+            },
+            {
+                'user': users[1].pk,
+                'enabled': False,
+            },
+            {
+                'user': users[2].pk,
+                'enabled': True,
+                'write_enabled': False,
+            },
+        ]
+
+        cls.update_data = {
+            'description': 'Token 1',
+        }
+
+    def test_provision_token_valid(self):
+        """
+        Test the provisioning of a new REST API token given a valid username and password.
+        """
+        user_credentials = {
+            'username': 'user1',
+            'password': 'abc123',
+        }
+        user = User.objects.create_user(**user_credentials)
+
+        data = {
+            **user_credentials,
+            'description': 'My API token',
+            'expires': '2099-12-31T23:59:59Z',
+        }
+        url = reverse('users-api:token_provision')
+
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 201)
+        self.assertIn('token', response.data)
+        self.assertEqual(len(response.data['token']), TOKEN_DEFAULT_LENGTH)
+        self.assertEqual(response.data['description'], data['description'])
+        self.assertEqual(response.data['expires'], data['expires'])
+        token = Token.objects.get(user=user)
+        self.assertEqual(token.key, response.data['key'])
+        self.assertEqual(token.enabled, response.data['enabled'])
+        self.assertEqual(token.write_enabled, response.data['write_enabled'])
+
+    def test_provision_token_invalid(self):
+        """
+        Test the behavior of the token provisioning view when invalid credentials are supplied.
+        """
+        data = {
+            'username': 'nonexistentuser',
+            'password': 'abc123',
+        }
+        url = reverse('users-api:token_provision')
+
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 403)
+
+    def test_provision_token_other_user(self):
+        """
+        Test provisioning a Token for a different User with & without the grant_token permission.
+        """
+        # Clear grant_token permission assigned by setUpTestData
+        ObjectPermission.objects.filter(users=self.user).delete()
+
+        self.add_permissions('users.add_token')
+        user2 = User.objects.create_user(username='testuser2')
+        data = {
+            'user': user2.id,
+        }
+        url = reverse('users-api:token-list')
+
+        # Attempt to create a new Token for User2 *without* the grant_token permission
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 403)
+
+        # Assign grant_token permission and successfully create a new Token for User2
+        self.add_permissions('users.grant_token')
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 201)
+
+    def test_grant_token_constrained_permission_is_enforced(self):
+        """
+        Regression: SR-001 / VM-322 — constrained grant_token ObjectPermissions must not be
+        bypassed. has_perm('users.grant_token', obj=None) short-circuits to True without
+        evaluating constraints; the fix uses user_may_grant_token() which applies them.
+        """
+        # Clear the unconstrained grant_token added by setUp.
+        ObjectPermission.objects.filter(users=self.user, actions__contains=['grant']).delete()
+        self.add_permissions('users.add_token')
+
+        superuser = User.objects.create_user(username='sec_superuser', is_superuser=True)
+        regular = User.objects.create_user(username='sec_regular')
+
+        # Add a *constrained* grant_token permission: only tokens for non-superusers.
+        token_ct = ObjectType.objects.get_by_natural_key('users', 'token')
+        perm = ObjectPermission(
+            name='constrained_grant_token',
+            constraints={'user__is_superuser': False},
+            actions=['grant'],
+        )
+        perm.save()
+        perm.users.add(self.user)
+        perm.object_types.add(token_ct)
+
+        url = reverse('users-api:token-list')
+
+        # Attempt to create a token for the superuser — must be denied (constraint violation).
+        response = self.client.post(url, {'user': superuser.pk}, format='json', **self.header)
+        self.assertEqual(
+            response.status_code, 403,
+            "Constrained grant_token must deny token creation for users that violate the constraint",
+        )
+
+        # Attempt to create a token for the regular user — must succeed.
+        response = self.client.post(url, {'user': regular.pk}, format='json', **self.header)
+        self.assertEqual(
+            response.status_code, 201,
+            "Constrained grant_token must allow token creation for users that satisfy the constraint",
+        )
+
+    def test_grant_token_superuser_always_allowed(self):
+        """
+        Superusers must be able to create tokens for any user without an explicit
+        grant_token ObjectPermission. Regression guard: _user_may_grant_token() must
+        mirror ObjectPermissionMixin.has_perm's superuser bypass.
+        """
+        ObjectPermission.objects.filter(users=self.user, actions__contains=['grant']).delete()
+        self.add_permissions('users.add_token')
+        self.user.is_superuser = True
+        self.user.save()
+        try:
+            other = User.objects.create_user(username='superuser_grant_target')
+            url = reverse('users-api:token-list')
+            response = self.client.post(url, {'user': other.pk}, format='json', **self.header)
+            self.assertEqual(response.status_code, 201, "Superuser must be able to grant tokens for any user")
+        finally:
+            self.user.is_superuser = False
+            self.user.save()
+
+    def test_grant_token_self_only_constraint(self):
+        """
+        A {"user": "$user"} constraint means "only grant tokens for yourself".
+        Since creating a token for oneself bypasses the grant_token check entirely,
+        this constraint effectively blocks all cross-user grants for the holder.
+        Exercises the $user placeholder substitution path.
+        """
+        ObjectPermission.objects.filter(users=self.user, actions__contains=['grant']).delete()
+        self.add_permissions('users.add_token')
+        token_ct = ObjectType.objects.get_by_natural_key('users', 'token')
+        perm = ObjectPermission(name='self_only_grant', constraints={'user': '$user'}, actions=['grant'])
+        perm.save()
+        perm.users.add(self.user)
+        perm.object_types.add(token_ct)
+
+        other = User.objects.create_user(username='self_only_target')
+        url = reverse('users-api:token-list')
+        response = self.client.post(url, {'user': other.pk}, format='json', **self.header)
+        self.assertEqual(response.status_code, 403, "Self-only constraint must deny cross-user token grants")
+
+    def test_grant_token_non_user_field_constraint_fails_closed(self):
+        """
+        A constraint referencing a non-user Token field (e.g. {"write_enabled": True})
+        cannot be evaluated for an unsaved token; _user_may_grant_token() must fail
+        closed and deny rather than bypass the constraint.
+        """
+        ObjectPermission.objects.filter(users=self.user, actions__contains=['grant']).delete()
+        self.add_permissions('users.add_token')
+        token_ct = ObjectType.objects.get_by_natural_key('users', 'token')
+        perm = ObjectPermission(
+            name='non_user_field_grant', constraints={'write_enabled': True}, actions=['grant']
+        )
+        perm.save()
+        perm.users.add(self.user)
+        perm.object_types.add(token_ct)
+
+        other = User.objects.create_user(username='non_user_field_target')
+        url = reverse('users-api:token-list')
+        response = self.client.post(url, {'user': other.pk}, format='json', **self.header)
+        self.assertEqual(
+            response.status_code, 403,
+            "Non-user Token field constraints must fail closed for new (unsaved) tokens",
+        )
+
+    def test_create_token_returns_plaintext(self):
+        """
+        Creating a Token via the REST API must return the usable plaintext value in the response.
+        For v2 tokens this value cannot be recovered later because the database stores only an
+        HMAC digest.
+        """
+        self.add_permissions('users.add_token')
+        user = User.objects.create_user(username='token_plaintext_user')
+        url = reverse('users-api:token-list')
+
+        response = self.client.post(url, {'user': user.pk}, format='json', **self.header)
+        self.assertEqual(response.status_code, 201)
+        self.assertIsNotNone(response.data['token'])
+        self.assertEqual(len(response.data['token']), TOKEN_DEFAULT_LENGTH)
+
+        # The returned plaintext must authenticate against the stored token
+        token = Token.objects.get(pk=response.data['id'])
+        self.assertTrue(token.validate(response.data['token']))
+
+    def test_bulk_create_tokens_returns_plaintexts(self):
+        """
+        Bulk-creating Tokens via the REST API must return the plaintext value for each created
+        Token in the response.
+        """
+        self.add_permissions('users.add_token')
+        users = [
+            User.objects.create_user(username='token_bulk_user1'),
+            User.objects.create_user(username='token_bulk_user2'),
+        ]
+        data = [{'user': u.pk} for u in users]
+        url = reverse('users-api:token-list')
+
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(len(response.data), len(data))
+
+        plaintexts = set()
+        for obj in response.data:
+            self.assertIsNotNone(obj['token'])
+            self.assertEqual(len(obj['token']), TOKEN_DEFAULT_LENGTH)
+            plaintexts.add(obj['token'])
+            token = Token.objects.get(pk=obj['id'])
+            self.assertTrue(token.validate(obj['token']))
+
+        # Each token should be unique
+        self.assertEqual(len(plaintexts), len(data))
+
+    def test_background_bulk_create_tokens_rejected(self):
+        """
+        Bulk Token creation cannot be backgrounded. The plaintext of a created v2 Token would
+        otherwise be captured into the job's data, where it is readable for the job's lifetime.
+        """
+        self.add_permissions('users.add_token')
+        users = [
+            User.objects.create_user(username='token_bg_user1'),
+            User.objects.create_user(username='token_bg_user2'),
+        ]
+        data = [{'user': u.pk} for u in users]
+        url = reverse('users-api:token-list')
+
+        response = self.client.post(f'{url}?background=true', data, format='json', **self.header)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data['detail'], 'Background processing is not supported for this endpoint.'
+        )
+        self.assertEqual(Job.objects.count(), 0)
+        for user in users:
+            self.assertFalse(Token.objects.filter(user=user).exists())
+
+    def test_background_bulk_update_and_delete_tokens_rejected(self):
+        """
+        The opt-out covers the whole Token endpoint, not only creation, and the requested
+        modifications and deletions do not occur.
+        """
+        self.add_permissions('users.change_token', 'users.delete_token')
+        # Token orders by '-created', so first() would return the test user's own auth Token.
+        token = Token.objects.get(user__username='User 1')
+        url = reverse('users-api:token-list')
+
+        for method in (self.client.put, self.client.patch):
+            with self.subTest(method=method.__name__):
+                response = method(
+                    f'{url}?background=true', [{'id': token.pk, 'description': 'bg'}],
+                    format='json', **self.header
+                )
+                self.assertEqual(response.status_code, 400)
+
+        response = self.client.delete(
+            f'{url}?background=true', [{'id': token.pk}], format='json', **self.header
+        )
+        self.assertEqual(response.status_code, 400)
+
+        self.assertEqual(Job.objects.count(), 0)
+        token.refresh_from_db()
+        self.assertNotEqual(token.description, 'bg')
+
+    def test_synchronous_token_creation_unaffected_by_opt_out(self):
+        """
+        The opt-out only refuses background processing. A single-object write with
+        `background=true` and a bulk write with `background=false` both run synchronously and
+        still return a usable plaintext.
+        """
+        self.add_permissions('users.add_token')
+        url = reverse('users-api:token-list')
+
+        single_user = User.objects.create_user(username='token_bg_single_user')
+        response = self.client.post(
+            f'{url}?background=true', {'user': single_user.pk}, format='json', **self.header
+        )
+        self.assertEqual(response.status_code, 201)
+        token = Token.objects.get(pk=response.data['id'])
+        self.assertTrue(token.validate(response.data['token']))
+
+        bulk_users = [
+            User.objects.create_user(username='token_bg_false_user1'),
+            User.objects.create_user(username='token_bg_false_user2'),
+        ]
+        response = self.client.post(
+            f'{url}?background=false', [{'user': u.pk} for u in bulk_users],
+            format='json', **self.header
+        )
+        self.assertEqual(response.status_code, 201)
+        for obj in response.data:
+            self.assertEqual(len(obj['token']), TOKEN_DEFAULT_LENGTH)
+            self.assertTrue(Token.objects.get(pk=obj['id']).validate(obj['token']))
+
+        self.assertEqual(Job.objects.count(), 0)
+
+    def test_token_plaintext_is_not_returned_on_subsequent_reads(self):
+        """
+        A v2 Token's plaintext is returned only by the creating response. Any later read of the
+        same object returns no usable value.
+        """
+        self.add_permissions('users.add_token', 'users.view_token')
+        user = User.objects.create_user(username='token_reread_user')
+
+        response = self.client.post(
+            reverse('users-api:token-list'), {'user': user.pk, 'version': 2},
+            format='json', **self.header
+        )
+        self.assertEqual(response.status_code, 201)
+        plaintext = response.data['token']
+        self.assertEqual(len(plaintext), TOKEN_DEFAULT_LENGTH)
+
+        detail = self.client.get(
+            reverse('users-api:token-detail', kwargs={'pk': response.data['id']}), **self.header
+        )
+        self.assertEqual(detail.status_code, 200)
+        self.assertFalse(detail.data.get('token'))
+
+    def test_queued_background_token_job_creates_nothing(self):
+        """
+        A Token job enqueued before the endpoint opted out is refused when the worker picks it
+        up, so no Token is created and no plaintext is captured into the job's data.
+        """
+        self.add_permissions('users.add_token')
+        user = User.objects.create_user(username='token_queued_user')
+        token_count = Token.objects.count()
+
+        raw_request = RequestFactory().post(
+            '/api/users/tokens/', data=[], content_type='application/json'
+        )
+        raw_request.user = self.user
+        request_copy = copy_safe_request(raw_request)
+
+        for action in ('create', 'bulk_create'):
+            with self.subTest(action=action):
+                job = Job.objects.create(
+                    name='Bulk create tokens', user=self.user, job_id=uuid.uuid4()
+                )
+                with self.assertRaises(JobFailed):
+                    AsyncAPIJob(job).run(
+                        viewset_class='users.api.views.TokenViewSet',
+                        action=action,
+                        payload=[{'user': user.pk}],
+                        user_pk=self.user.pk,
+                        request=request_copy,
+                        scheme='http',
+                    )
+
+                job.refresh_from_db()
+                self.assertEqual(job.data['status_code'], 400)
+                self.assertEqual(
+                    job.error, 'Background processing is not supported for this endpoint.'
+                )
+                # Pinning the whole body is what fails if the guard moves below the action.
+                self.assertEqual(
+                    job.data['data'],
+                    {'detail': 'Background processing is not supported for this endpoint.'}
+                )
+                self.assertEqual(Token.objects.count(), token_count)
+
+    def test_create_token_ignores_client_supplied_plaintext(self):
+        """
+        A client must not be able to choose a Token's plaintext value. Any `token` value supplied in a
+        create request must be ignored in favor of a randomly-generated value (for both v1 and v2 tokens).
+        """
+        self.add_permissions('users.add_token')
+        url = reverse('users-api:token-list')
+        chosen_plaintext = 'a' * TOKEN_DEFAULT_LENGTH
+
+        for version in (1, 2):
+            user = User.objects.create_user(username=f'chosen_plaintext_user_v{version}')
+            data = {
+                'user': user.pk,
+                'version': version,
+                'token': chosen_plaintext,
+            }
+            response = self.client.post(url, data, format='json', **self.header)
+            self.assertEqual(response.status_code, 201)
+
+            # The returned plaintext must not match the client-supplied value
+            returned = response.data['token']
+            self.assertIsNotNone(returned)
+            self.assertEqual(len(returned), TOKEN_DEFAULT_LENGTH)
+            self.assertNotEqual(returned, chosen_plaintext)
+
+            # The stored secret must be the randomly-generated value, not the client-supplied one
+            token = Token.objects.get(pk=response.data['id'])
+            self.assertEqual(token.version, version)
+            if version == 1:
+                # v1 tokens are authenticated by direct plaintext lookup
+                self.assertEqual(token.plaintext, returned)
+                self.assertNotEqual(token.plaintext, chosen_plaintext)
+            else:
+                # v2 tokens are authenticated by validating the plaintext against the stored HMAC digest
+                self.assertTrue(token.validate(returned))
+                self.assertFalse(token.validate(chosen_plaintext))
+
+    def test_reassign_token(self):
+        """
+        Check that a Token cannot be reassigned to another User.
+        """
+        user1 = User.objects.get(username='User 1')
+        user2 = User.objects.get(username='User 2')
+        token1 = Token.objects.filter(user=user1).first()
+        self.add_permissions('users.change_token')
+
+        data = {
+            'user': user2.pk,
+        }
+        url = self._get_detail_url(token1)
+        response = self.client.patch(url, data, format='json', **self.header)
+        # Response should succeed because the read-only `user` field is ignored
+        self.assertEqual(response.status_code, 200)
+        token1.refresh_from_db()
+        self.assertEqual(token1.user, user1, "Token's user should not have changed")
+
+
+class ObjectPermissionTestCase(
+    # No GraphQL support for ObjectPermission
+    APIViewTestCases.GetObjectViewTestCase,
+    APIViewTestCases.ListObjectsViewTestCase,
+    APIViewTestCases.CreateObjectViewTestCase,
+    APIViewTestCases.UpdateObjectViewTestCase,
+    APIViewTestCases.DeleteObjectViewTestCase
+):
+    model = ObjectPermission
+    brief_fields = ['actions', 'description', 'display', 'enabled', 'id', 'name', 'object_types', 'url']
+
+    @classmethod
+    def setUpTestData(cls):
+
+        groups = (
+            Group(name='Group 1'),
+            Group(name='Group 2'),
+            Group(name='Group 3'),
+        )
+        Group.objects.bulk_create(groups)
+
+        users = (
+            User(username='User1', is_active=True),
+            User(username='User2', is_active=True),
+            User(username='User3', is_active=True),
+        )
+        User.objects.bulk_create(users)
+
+        object_type = ObjectType.objects.get(app_label='dcim', model='device')
+
+        for i in range(3):
+            objectpermission = ObjectPermission(
+                name=f'Permission {i + 1}',
+                actions=['view', 'add', 'change', 'delete'],
+                constraints={'name': f'TEST{i + 1}'}
+            )
+            objectpermission.save()
+            objectpermission.object_types.add(object_type)
+            objectpermission.groups.add(groups[i])
+            objectpermission.users.add(users[i])
+
+        cls.create_data = [
+            {
+                'name': 'Permission 4',
+                'object_types': ['dcim.site'],
+                'groups': [groups[0].pk],
+                'users': [users[0].pk],
+                'actions': ['view', 'add', 'change', 'delete'],
+                'constraints': {'name': 'TEST4'},
+            },
+            {
+                'name': 'Permission 5',
+                'object_types': ['dcim.site'],
+                'groups': [groups[1].pk],
+                'users': [users[1].pk],
+                'actions': ['view', 'add', 'change', 'delete'],
+                'constraints': {'name': 'TEST5'},
+            },
+            {
+                'name': 'Permission 6',
+                'object_types': ['dcim.site'],
+                'groups': [groups[2].pk],
+                'users': [users[2].pk],
+                'actions': ['view', 'add', 'change', 'delete'],
+                'constraints': {'name': 'TEST6'},
+            },
+        ]
+
+        cls.bulk_update_data = {
+            'description': 'New description',
+        }
+        cls.bulk_update_invalid_data = {
+            'users': [99999],
+        }
+
+
+class UserConfigTestCase(APITestCase):
+
+    def test_get(self):
+        """
+        Retrieve user configuration via GET request.
+        """
+        userconfig = self.user.config
+        url = reverse('users-api:userconfig-list')
+
+        response = self.client.get(url, **self.header)
+        self.assertEqual(response.data, {})
+
+        data = {
+            "a": 123,
+            "b": 456,
+            "c": 789,
+        }
+        userconfig.data = data
+        userconfig.save()
+        response = self.client.get(url, **self.header)
+        self.assertEqual(response.data, data)
+
+    def test_patch(self):
+        """
+        Set user config via PATCH requests.
+        """
+        userconfig = self.user.config
+        url = reverse('users-api:userconfig-list')
+
+        data = {
+            "a": {
+                "a1": "X",
+                "a2": "Y",
+            },
+            "b": {
+                "b1": "Z",
+            }
+        }
+        response = self.client.patch(url, data=data, format='json', **self.header)
+        self.assertDictEqual(response.data, data)
+        userconfig.refresh_from_db()
+        self.assertDictEqual(userconfig.data, data)
+
+        update_data = {
+            "c": 123
+        }
+        response = self.client.patch(url, data=update_data, format='json', **self.header)
+        new_data = deepmerge(data, update_data)
+        self.assertDictEqual(response.data, new_data)
+        userconfig.refresh_from_db()
+        self.assertDictEqual(userconfig.data, new_data)
+
+
+class OwnerGroupTestCase(APIViewTestCases.APIViewTestCase):
+    model = OwnerGroup
+    brief_fields = ['description', 'display', 'id', 'name', 'url']
+    bulk_update_data = {
+        'description': 'New description',
+    }
+    # OwnerGroupSerializer exposes only name, description, and a read-only member_count, so an
+    # over-length description is the only value available to trigger a validation error.
+    bulk_update_invalid_data = {
+        'description': 'a' * 201,
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+        owner_groups = (
+            OwnerGroup(name='Owner Group 1'),
+            OwnerGroup(name='Owner Group 2'),
+            OwnerGroup(name='Owner Group 3'),
+        )
+        OwnerGroup.objects.bulk_create(owner_groups)
+
+        cls.create_data = [
+            {
+                'name': 'Owner Group 4',
+                'description': 'Fourth owner group',
+            },
+            {
+                'name': 'Owner Group 5',
+                'description': 'Fifth owner group',
+            },
+            {
+                'name': 'Owner Group 6',
+                'description': 'Sixth owner group',
+            },
+        ]
+
+
+class OwnerTestCase(APIViewTestCases.APIViewTestCase):
+    model = Owner
+    brief_fields = ['description', 'display', 'id', 'name', 'url']
+
+    @classmethod
+    def setUpTestData(cls):
+        owner_groups = (
+            OwnerGroup(name='Owner Group 1'),
+            OwnerGroup(name='Owner Group 2'),
+            OwnerGroup(name='Owner Group 3'),
+            OwnerGroup(name='Owner Group 4'),
+        )
+        OwnerGroup.objects.bulk_create(owner_groups)
+
+        groups = (
+            Group(name='Group 1'),
+            Group(name='Group 2'),
+            Group(name='Group 3'),
+            Group(name='Group 4'),
+        )
+        Group.objects.bulk_create(groups)
+
+        users = (
+            User(username='User 1'),
+            User(username='User 2'),
+            User(username='User 3'),
+            User(username='User 4'),
+        )
+        User.objects.bulk_create(users)
+
+        owners = (
+            Owner(name='Owner 1'),
+            Owner(name='Owner 2'),
+            Owner(name='Owner 3'),
+        )
+        Owner.objects.bulk_create(owners)
+
+        # Assign users and groups to owners
+        owners[0].user_groups.add(groups[0])
+        owners[1].user_groups.add(groups[1])
+        owners[2].user_groups.add(groups[2])
+        owners[0].users.add(users[0])
+        owners[1].users.add(users[1])
+        owners[2].users.add(users[2])
+
+        cls.create_data = [
+            {
+                'name': 'Owner 4',
+                'description': 'Fourth owner',
+                'group': owner_groups[3].pk,
+                'user_groups': [groups[3].pk],
+                'users': [users[3].pk],
+            },
+            {
+                'name': 'Owner 5',
+                'description': 'Fifth owner',
+                'group': owner_groups[3].pk,
+                'user_groups': [groups[3].pk],
+                'users': [users[3].pk],
+            },
+            {
+                'name': 'Owner 6',
+                'description': 'Sixth owner',
+                'group': owner_groups[3].pk,
+                'user_groups': [groups[3].pk],
+                'users': [users[3].pk],
+            },
+        ]
+
+        cls.bulk_update_data = {
+            'group': owner_groups[3].pk,
+            'user_groups': [groups[3].pk],
+            'users': [users[3].pk],
+            'description': 'New description',
+        }
+
+        cls.bulk_update_invalid_data = {
+            'group': 99999,
+        }

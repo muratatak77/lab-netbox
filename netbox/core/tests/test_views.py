@@ -1,0 +1,603 @@
+import json
+import urllib.parse
+import uuid
+from datetime import UTC, datetime
+
+from django.contrib.contenttypes.models import ContentType
+from django.urls import reverse
+from django.utils import timezone
+from django_rq import get_queue
+from django_rq.settings import get_queues_map
+from django_rq.workers import get_worker
+from rq.job import Job as RQ_Job
+from rq.job import JobStatus
+from rq.registry import DeferredJobRegistry, FailedJobRegistry, FinishedJobRegistry, StartedJobRegistry
+
+from core.choices import ObjectChangeActionChoices
+from core.models import *
+from dcim.models import Site
+from users.models import ObjectPermission, User
+from utilities.testing import TestCase, ViewTestCases, create_tags, disable_logging
+from utilities.testing.mixins import RQQueueTestMixin
+
+
+class DataSourceTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = DataSource
+
+    @classmethod
+    def setUpTestData(cls):
+        data_sources = (
+            DataSource(name='Data Source 1', type='local', source_url='file:///var/tmp/source1/'),
+            DataSource(name='Data Source 2', type='local', source_url='file:///var/tmp/source2/'),
+            DataSource(name='Data Source 3', type='local', source_url='file:///var/tmp/source3/'),
+        )
+        DataSource.objects.bulk_create(data_sources)
+
+        tags = create_tags('Alpha', 'Bravo', 'Charlie')
+
+        cls.form_data = {
+            'name': 'Data Source X',
+            'type': 'git',
+            'source_url': 'http:///exmaple/com/foo/bar/',
+            'description': 'Something',
+            'comments': 'Foo bar baz',
+            'tags': [t.pk for t in tags],
+        }
+
+        cls.csv_data = (
+            "name,type,source_url,enabled",
+            "Data Source 4,local,file:///var/tmp/source4/,true",
+            "Data Source 5,local,file:///var/tmp/source4/,true",
+            "Data Source 6,git,http:///exmaple/com/foo/bar/,false",
+        )
+
+        cls.csv_update_data = (
+            "id,name,description",
+            f"{data_sources[0].pk},Data Source 7,New description7",
+            f"{data_sources[1].pk},Data Source 8,New description8",
+            f"{data_sources[2].pk},Data Source 9,New description9",
+        )
+
+        cls.bulk_edit_data = {
+            'enabled': False,
+            'description': 'New description',
+        }
+
+    def test_sync_form_submission_guard(self):
+        """The Sync form of a ready data source opts into the duplicate submission guard."""
+        self.add_permissions('core.view_datasource', 'core.sync_datasource')
+        datasource = DataSource.objects.first()
+        url = reverse('core:datasource_sync', kwargs={'pk': datasource.pk})
+
+        response = self.client.get(datasource.get_absolute_url())
+
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, f'<form action="{url}" method="post" data-disable-on-submit>')
+
+    def test_sync_buttons_submission_guard(self):
+        """Each ready data source's Sync button opts into the duplicate submission guard."""
+        self.add_permissions('core.view_datasource', 'core.sync_datasource')
+        list_url = reverse('core:datasource_list')
+
+        response = self.client.get(list_url)
+
+        self.assertHttpStatus(response, 200)
+        for name in ('Data Source 1', 'Data Source 2', 'Data Source 3'):
+            url = reverse('core:datasource_sync', kwargs={'pk': DataSource.objects.get(name=name).pk})
+            self.assertContains(
+                response, f'formaction="{url}?return_url={list_url}" formmethod="post" data-disable-on-submit>'
+            )
+
+
+class DataFileTestCase(
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase,
+):
+    model = DataFile
+
+    @classmethod
+    def setUpTestData(cls):
+        datasource = DataSource.objects.create(
+            name='Data Source 1',
+            type='local',
+            source_url='file:///var/tmp/source1/'
+        )
+
+        data_files = (
+            DataFile(
+                source=datasource,
+                path='dir1/file1.txt',
+                last_updated=timezone.now(),
+                size=1000,
+                hash='442da078f0111cbdf42f21903724f6597c692535f55bdfbbea758a1ae99ad9e1'
+            ),
+            DataFile(
+                source=datasource,
+                path='dir1/file2.txt',
+                last_updated=timezone.now(),
+                size=2000,
+                hash='a78168c7c97115bafd96450ed03ea43acec495094c5caa28f0d02e20e3a76cc2'
+            ),
+            DataFile(
+                source=datasource,
+                path='dir1/file3.txt',
+                last_updated=timezone.now(),
+                size=3000,
+                hash='12b8827a14c4d5a2f30b6c6e2b7983063988612391c6cbe8ee7493b59054827a'
+            ),
+        )
+        DataFile.objects.bulk_create(data_files)
+
+    def test_content_is_not_cacheable(self):
+        """
+        The detail view renders file content inline, which may include plaintext secrets, so the
+        response must instruct the browser not to persist it to its local cache.
+        """
+        datafile = DataFile.objects.first()
+        datafile.data = b'super-secret-password'
+        datafile.save()
+
+        self.add_permissions('core.view_datafile')
+        response = self.client.get(datafile.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+
+        # Confirm the content is in fact rendered in the response
+        self.assertIn('super-secret-password', str(response.content))
+
+        # Confirm the response is not cacheable
+        self.assertNotCacheable(response)
+
+
+class JobTestCase(
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase,
+):
+    model = Job
+
+    @classmethod
+    def setUpTestData(cls):
+        datasource = DataSource.objects.create(
+            name='Data Source 1',
+            type='local',
+            source_url='file:///var/tmp/source1/',
+        )
+        ct = ContentType.objects.get_for_model(DataSource)
+        Job.objects.bulk_create(
+            [
+                Job(
+                    name='Job 1',
+                    object_type=ct,
+                    object_id=datasource.pk,
+                    status='pending',
+                    queue_name='default',
+                    job_id=uuid.uuid4(),
+                ),
+                Job(
+                    name='Job 2',
+                    object_type=ct,
+                    object_id=datasource.pk,
+                    status='running',
+                    queue_name='default',
+                    job_id=uuid.uuid4(),
+                ),
+                Job(
+                    name='Job 3',
+                    object_type=ct,
+                    object_id=datasource.pk,
+                    status='completed',
+                    queue_name='default',
+                    job_id=uuid.uuid4(),
+                ),
+            ]
+        )
+
+
+class ObjectJobsViewTestCase(TestCase):
+    """
+    The Jobs tab of an object must list only the Jobs which the user is permitted to view.
+    """
+    user_permissions = (
+        'core.view_datasource',
+    )
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.datasource = DataSource.objects.create(
+            name='Data Source 1',
+            type='local',
+            source_url='file:///var/tmp/source1/',
+        )
+        cls.other_user = User.objects.create_user(username='otheruser')
+        cls.other_job = cls._create_job('other-job', user=cls.other_user)
+        cls.system_job = cls._create_job('system-job', user=None)
+
+    @classmethod
+    def _create_job(cls, name, user):
+        return Job.objects.create(
+            name=name,
+            object_type=ContentType.objects.get_for_model(DataSource),
+            object_id=cls.datasource.pk,
+            status='completed',
+            job_id=uuid.uuid4(),
+            user=user,
+        )
+
+    def setUp(self):
+        super().setUp()
+        self.own_job = self._create_job('own-job', user=self.user)
+        self.url = reverse('core:datasource_jobs', kwargs={'pk': self.datasource.pk})
+
+    def _grant_view_job(self, constraints=None):
+        obj_perm = ObjectPermission(name='View jobs', constraints=constraints, actions=['view'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Job))
+
+    def _get_listed_jobs(self):
+        response = self.client.get(self.url)
+        self.assertHttpStatus(response, 200)
+        return {row.record for row in response.context['table'].rows}
+
+    def test_unconstrained_permission_lists_all_jobs(self):
+        self._grant_view_job()
+        self.assertEqual(self._get_listed_jobs(), {self.own_job, self.other_job, self.system_job})
+
+    def test_user_constrained_permission_lists_own_jobs_only(self):
+        self._grant_view_job(constraints={'user': '$user'})
+        self.assertEqual(self._get_listed_jobs(), {self.own_job})
+
+    def test_without_view_job_permission_lists_no_jobs(self):
+        self.assertEqual(self._get_listed_jobs(), set())
+
+
+class JobLogViewTestCase(TestCase):
+    user_permissions = (
+        'core.view_job',
+    )
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.job = Job.objects.create(
+            name='Test Job',
+            job_id=uuid.uuid4(),
+        )
+        cls.job.log_entries = [
+            {
+                'level': 'info',
+                'message': f'log line {i}',
+                'timestamp': datetime(2026, 1, 1, tzinfo=UTC),
+            }
+            for i in range(120)
+        ]
+        cls.job.save()
+
+    def setUp(self):
+        super().setUp()
+        # Pin per_page so page-boundary assertions don't depend on PAGINATE_COUNT.
+        self.user.config.data = {'pagination': {'per_page': 50}}
+        self.user.config.save()
+
+    def test_log_page_renders_table_inline(self):
+        """The full page renders the first log page inside an HTMX container."""
+        url = reverse('core:job_log', kwargs={'pk': self.job.pk})
+        response = self.client.get(url)
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'htmx-container')
+        self.assertContains(response, 'log line 0')
+        self.assertContains(response, 'Showing 1-50 of 120')
+
+    def test_log_page_table_is_embedded(self):
+        """The embedded table never pushes page/per_page into the browser URL."""
+        url = reverse('core:job_log', kwargs={'pk': self.job.pk})
+        response = self.client.get(url)
+        self.assertHttpStatus(response, 200)
+        self.assertNotContains(response, 'hx-push-url="true"')
+
+    def test_log_table_htmx_renders_partial(self):
+        """An HTMX request returns the paginated table partial."""
+        url = reverse('core:job_log', kwargs={'pk': self.job.pk})
+        response = self.client.get(url, headers={'hx-request': 'true'})
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'log line 0')
+        self.assertContains(response, 'Showing 1-50 of 120')
+        self.assertContains(response, 'Per Page')
+
+    def test_log_table_htmx_page_navigation(self):
+        """`?page=2` advances the embedded table to the second page."""
+        url = reverse('core:job_log', kwargs={'pk': self.job.pk})
+        response = self.client.get(f'{url}?page=2', headers={'hx-request': 'true'})
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'log line 50')
+        self.assertNotContains(response, 'log line 49')
+
+    def test_log_table_htmx_per_page(self):
+        """`?per_page=100` widens the embedded table page size."""
+        url = reverse('core:job_log', kwargs={'pk': self.job.pk})
+        response = self.client.get(f'{url}?per_page=100', headers={'hx-request': 'true'})
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, 'log line 99')
+        self.assertNotContains(response, 'log line 100')
+
+
+# TODO: Convert to StandardTestCases.Views
+class ObjectChangeTestCase(TestCase):
+    user_permissions = (
+        'core.view_objectchange',
+    )
+
+    @classmethod
+    def setUpTestData(cls):
+
+        site = Site(name='Site 1', slug='site-1')
+        site.save()
+
+        # Create three ObjectChanges
+        user = User.objects.create_user(username='testuser2')
+        for i in range(1, 4):
+            oc = site.to_objectchange(action=ObjectChangeActionChoices.ACTION_UPDATE)
+            oc.user = user
+            oc.request_id = uuid.uuid4()
+            oc.save()
+
+    def test_objectchange_list(self):
+
+        url = reverse('core:objectchange_list')
+        params = {
+            "user": User.objects.first().pk,
+        }
+
+        response = self.client.get('{}?{}'.format(url, urllib.parse.urlencode(params)))
+        self.assertHttpStatus(response, 200)
+
+    def test_objectchange(self):
+
+        objectchange = ObjectChange.objects.first()
+        response = self.client.get(objectchange.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+
+
+class BackgroundTaskTestCase(RQQueueTestMixin, TestCase):
+    user_permissions = ()
+
+    # Dummy worker functions
+    @staticmethod
+    def dummy_job_default():
+        return "Job finished"
+
+    @staticmethod
+    def dummy_job_high():
+        return "Job finished"
+
+    @staticmethod
+    def dummy_job_failing():
+        raise Exception("Job failed")
+
+    def setUp(self):
+        super().setUp()
+        self.user.is_superuser = True
+        self.user.is_active = True
+        self.user.save()
+
+    def test_background_queue_list(self):
+        url = reverse('core:background_queue_list')
+
+        # Attempt to load view without permission
+        self.user.is_superuser = False
+        self.user.save()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 403)
+
+        # Load view with permission
+        self.user.is_superuser = True
+        self.user.save()
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('default', str(response.content))
+        self.assertIn('high', str(response.content))
+        self.assertIn('low', str(response.content))
+
+    def test_background_tasks_list_default(self):
+        queue = get_queue('default')
+        queue.enqueue(self.dummy_job_default)
+        queue_index = get_queues_map()['default']
+
+        response = self.client.get(reverse('core:background_task_list', args=[queue_index, 'queued']))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('BackgroundTaskTestCase.dummy_job_default', str(response.content))
+
+    def test_background_tasks_list_high(self):
+        queue = get_queue('high')
+        queue.enqueue(self.dummy_job_high)
+        queue_index = get_queues_map()['high']
+
+        response = self.client.get(reverse('core:background_task_list', args=[queue_index, 'queued']))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('BackgroundTaskTestCase.dummy_job_high', str(response.content))
+
+    def test_background_tasks_list_finished(self):
+        queue = get_queue('default')
+        job = queue.enqueue(self.dummy_job_default)
+        queue_index = get_queues_map()['default']
+
+        registry = FinishedJobRegistry(queue.name, queue.connection)
+        registry.add(job, 2)
+        response = self.client.get(reverse('core:background_task_list', args=[queue_index, 'finished']))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('BackgroundTaskTestCase.dummy_job_default', str(response.content))
+
+    def test_background_tasks_list_failed(self):
+        queue = get_queue('default')
+        job = queue.enqueue(self.dummy_job_default)
+        queue_index = get_queues_map()['default']
+
+        registry = FailedJobRegistry(queue.name, queue.connection)
+        registry.add(job, 2)
+        response = self.client.get(reverse('core:background_task_list', args=[queue_index, 'failed']))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('BackgroundTaskTestCase.dummy_job_default', str(response.content))
+
+    def test_background_tasks_scheduled(self):
+        queue = get_queue('default')
+        queue.enqueue_at(datetime.now(), self.dummy_job_default)
+        queue_index = get_queues_map()['default']
+
+        response = self.client.get(reverse('core:background_task_list', args=[queue_index, 'scheduled']))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('BackgroundTaskTestCase.dummy_job_default', str(response.content))
+
+    def test_background_tasks_list_deferred(self):
+        queue = get_queue('default')
+        job = queue.enqueue(self.dummy_job_default)
+        queue_index = get_queues_map()['default']
+
+        registry = DeferredJobRegistry(queue.name, queue.connection)
+        registry.add(job, 2)
+        response = self.client.get(reverse('core:background_task_list', args=[queue_index, 'deferred']))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('BackgroundTaskTestCase.dummy_job_default', str(response.content))
+
+    def test_background_task(self):
+        queue = get_queue('default')
+        job = queue.enqueue(self.dummy_job_default)
+
+        response = self.client.get(reverse('core:background_task', args=[job.id]))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('Background Tasks', str(response.content))
+        self.assertIn(str(job.id), str(response.content))
+        self.assertIn('Callable', str(response.content))
+        self.assertIn('Meta', str(response.content))
+        self.assertIn('Keyword Arguments', str(response.content))
+
+    def test_background_task_delete(self):
+        queue = get_queue('default')
+        job = queue.enqueue(self.dummy_job_default)
+
+        response = self.client.post(reverse('core:background_task_delete', args=[job.id]), {'confirm': True})
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(RQ_Job.exists(job.id, connection=queue.connection))
+        self.assertNotIn(job.id, queue.job_ids)
+
+    def test_background_task_requeue(self):
+        queue = get_queue('default')
+
+        # Enqueue & run a job that will fail
+        job = queue.enqueue(self.dummy_job_failing)
+        with disable_logging():
+            self.run_rq_jobs('default')
+        self.assertTrue(job.is_failed)
+
+        # Re-enqueue the failed job and check that its status has been reset
+        response = self.client.get(reverse('core:background_task_requeue', args=[job.id]))
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(job.is_failed)
+
+    def test_background_task_enqueue(self):
+        queue = get_queue('default')
+
+        # Enqueue some jobs that each depends on its predecessor
+        job = previous_job = None
+        for _ in range(0, 3):
+            job = queue.enqueue(self.dummy_job_default, depends_on=previous_job)
+            previous_job = job
+
+        # Check that the last job to be enqueued has a status of deferred
+        self.assertIsNotNone(job)
+        self.assertEqual(job.get_status(), JobStatus.DEFERRED)
+        self.assertIsNone(job.enqueued_at)
+
+        # Force-enqueue the deferred job
+        response = self.client.get(reverse('core:background_task_enqueue', args=[job.id]))
+        self.assertEqual(response.status_code, 302)
+
+        # Check that job's status is updated correctly
+        job = queue.fetch_job(job.id)
+        self.assertEqual(job.get_status(), JobStatus.QUEUED)
+        self.assertIsNotNone(job.enqueued_at)
+
+    def test_background_task_stop(self):
+        queue = get_queue('default')
+
+        worker = get_worker('default')
+        job = queue.enqueue(self.dummy_job_default)
+        # prepare_job_execution() invokes the worker heartbeat, which logs a "re-registering"
+        # warning for this freshly-created (unregistered) worker; suppress the expected noise.
+        with disable_logging():
+            worker.prepare_job_execution(job)
+            worker.prepare_execution(job)
+
+        self.assertEqual(job.get_status(), JobStatus.STARTED)
+
+        # Stop those jobs using the view
+        started_job_registry = StartedJobRegistry(queue.name, connection=queue.connection)
+        self.assertEqual(len(started_job_registry), 1)
+        response = self.client.get(reverse('core:background_task_stop', args=[job.id]))
+        self.assertEqual(response.status_code, 302)
+        with disable_logging():
+            worker.monitor_work_horse(job, queue)  # Sets the job as Failed and removes from Started
+        self.assertEqual(len(started_job_registry), 0)
+
+        canceled_job_registry = FailedJobRegistry(queue.name, connection=queue.connection)
+        self.assertEqual(len(canceled_job_registry), 1)
+        self.assertIn(job.id, canceled_job_registry)
+
+    def test_worker_list(self):
+        worker1 = get_worker('default', name=uuid.uuid4().hex)
+        worker1.register_birth()
+
+        worker2 = get_worker('high')
+        worker2.register_birth()
+
+        queue_index = get_queues_map()['default']
+        response = self.client.get(reverse('core:worker_list', args=[queue_index]))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(str(worker1.name), str(response.content))
+        self.assertNotIn(str(worker2.name), str(response.content))
+
+    def test_worker(self):
+        worker1 = get_worker('default', name=uuid.uuid4().hex)
+        worker1.register_birth()
+
+        response = self.client.get(reverse('core:worker', args=[worker1.name]))
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(str(worker1.name), str(response.content))
+        self.assertIn('Birth', str(response.content))
+        self.assertIn('Total working time', str(response.content))
+
+
+class SystemTestCase(TestCase):
+
+    def setUp(self):
+        super().setUp()
+
+        self.user.is_superuser = True
+        self.user.save()
+
+    def test_system_view_default(self):
+        # Test UI render
+        response = self.client.get(reverse('core:system'))
+        self.assertEqual(response.status_code, 200)
+
+        # Test export
+        response = self.client.get(f"{reverse('core:system')}?export=true")
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertIn('netbox_release', data)
+        self.assertIn('plugins', data)
+        self.assertIn('config', data)
+        self.assertIn('objects', data)
+        self.assertIn('db_schema', data)
+
+    def test_system_view_with_config_revision(self):
+        ConfigRevision.objects.create()
+
+        # Test UI render
+        response = self.client.get(reverse('core:system'))
+        self.assertEqual(response.status_code, 200)
+
+        # Test export
+        response = self.client.get(f"{reverse('core:system')}?export=true")
+        self.assertEqual(response.status_code, 200)

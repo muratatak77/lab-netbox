@@ -1,0 +1,306 @@
+from django.test import TestCase, tag
+from netaddr import IPNetwork
+
+from dcim.models import Site
+from ipam.models import ASN, RIR, FHRPGroupAssignment, IPAddress, IPRange, Prefix
+from ipam.tables import *
+from ipam.utils import annotate_ip_space
+from utilities.testing import TableTestCases
+
+
+class AnnotatedIPAddressTableTestCase(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.prefix = Prefix.objects.create(
+            prefix=IPNetwork('10.1.1.0/24'),
+            status='active'
+        )
+
+        cls.ip_address = IPAddress.objects.create(
+            address='10.1.1.1/24',
+            status='active'
+        )
+
+        cls.ip_range = IPRange.objects.create(
+            start_address=IPNetwork('10.1.1.2/24'),
+            end_address=IPNetwork('10.1.1.10/24'),
+            status='active',
+            mark_populated=True,
+        )
+
+    def test_ipaddress_has_checkbox_iprange_does_not(self):
+        data = annotate_ip_space(self.prefix)
+        table = AnnotatedIPAddressTable(data, orderable=False)
+        table.columns.show('pk')
+
+        ipaddress_row = next(
+            row for row in table.rows
+            if isinstance(row.record, IPAddress) and row.record.pk == self.ip_address.pk
+        )
+        iprange_row = next(
+            row for row in table.rows
+            if isinstance(row.record, IPRange) and row.record.pk == self.ip_range.pk
+        )
+
+        self.assertIn('name="pk"', ipaddress_row.get_cell('pk'))
+        self.assertIn(f'value="{self.ip_address.pk}"', ipaddress_row.get_cell('pk'))
+        self.assertNotIn('name="pk"', iprange_row.get_cell('pk'))
+
+    def test_annotate_ip_space_ipv4_non_pool_excludes_network_and_broadcast(self):
+        prefix = Prefix.objects.create(
+            prefix=IPNetwork('192.0.2.0/29'),  # 8 addresses total
+            status='active',
+            is_pool=False,
+        )
+
+        data = annotate_ip_space(prefix)
+
+        self.assertEqual(len(data), 1)
+        available = data[0]
+
+        # /29 non-pool: exclude .0 (network) and .7 (broadcast)
+        self.assertEqual(available.first_ip, '192.0.2.1/29')
+        self.assertEqual(available.size, 6)
+
+    def test_annotate_ip_space_ipv4_pool_includes_network_and_broadcast(self):
+        prefix = Prefix.objects.create(
+            prefix=IPNetwork('192.0.2.8/29'),  # 8 addresses total
+            status='active',
+            is_pool=True,
+        )
+
+        data = annotate_ip_space(prefix)
+
+        self.assertEqual(len(data), 1)
+        available = data[0]
+
+        # Pool: all addresses are usable, including network/broadcast
+        self.assertEqual(available.first_ip, '192.0.2.8/29')
+        self.assertEqual(available.size, 8)
+
+    def test_annotate_ip_space_ipv4_31_includes_all_ips(self):
+        prefix = Prefix.objects.create(
+            prefix=IPNetwork('192.0.2.16/31'),  # 2 addresses total
+            status='active',
+            is_pool=False,
+        )
+
+        data = annotate_ip_space(prefix)
+
+        self.assertEqual(len(data), 1)
+        available = data[0]
+
+        # /31: fully usable
+        self.assertEqual(available.first_ip, '192.0.2.16/31')
+        self.assertEqual(available.size, 2)
+
+    def test_annotate_ip_space_ipv4_32_includes_single_ip(self):
+        prefix = Prefix.objects.create(
+            prefix=IPNetwork('192.0.2.100/32'),  # 1 address total
+            status='active',
+            is_pool=False,
+        )
+
+        data = annotate_ip_space(prefix)
+
+        self.assertEqual(len(data), 1)
+        available = data[0]
+
+        # /32: single usable address
+        self.assertEqual(available.first_ip, '192.0.2.100/32')
+        self.assertEqual(available.size, 1)
+
+    def test_annotate_ip_space_ipv6_non_pool_excludes_anycast_first_ip(self):
+        prefix = Prefix.objects.create(
+            prefix=IPNetwork('2001:db8::/126'),  # 4 addresses total
+            status='active',
+            is_pool=False,
+        )
+
+        data = annotate_ip_space(prefix)
+
+        # No child records -> expect one AvailableIPSpace entry
+        self.assertEqual(len(data), 1)
+        available = data[0]
+
+        # For IPv6 non-pool prefixes (except /127-/128), the first address is reserved (subnet-router anycast)
+        self.assertEqual(available.first_ip, '2001:db8::1/126')
+        self.assertEqual(available.size, 3)  # 4 total - 1 reserved anycast
+
+    def test_annotate_ip_space_ipv6_127_includes_all_ips(self):
+        prefix = Prefix.objects.create(
+            prefix=IPNetwork('2001:db8::/127'),  # 2 addresses total
+            status='active',
+            is_pool=False,
+        )
+
+        data = annotate_ip_space(prefix)
+
+        self.assertEqual(len(data), 1)
+        available = data[0]
+
+        # /127 is fully usable (no anycast exclusion)
+        self.assertEqual(available.first_ip, '2001:db8::/127')
+        self.assertEqual(available.size, 2)
+
+    def test_annotate_ip_space_ipv6_128_includes_single_ip(self):
+        prefix = Prefix.objects.create(
+            prefix=IPNetwork('2001:db8::1/128'),  # 1 address total
+            status='active',
+            is_pool=False,
+        )
+
+        data = annotate_ip_space(prefix)
+
+        self.assertEqual(len(data), 1)
+        available = data[0]
+
+        # /128 is fully usable (single host address)
+        self.assertEqual(available.first_ip, '2001:db8::1/128')
+        self.assertEqual(available.size, 1)
+
+    def test_annotate_ip_space_ipv6_pool_includes_anycast_first_ip(self):
+        prefix = Prefix.objects.create(
+            prefix=IPNetwork('2001:db8:1::/126'),  # 4 addresses total
+            status='active',
+            is_pool=True,
+        )
+
+        data = annotate_ip_space(prefix)
+
+        self.assertEqual(len(data), 1)
+        available = data[0]
+
+        # Pools are fully usable
+        self.assertEqual(available.first_ip, '2001:db8:1::/126')
+        self.assertEqual(available.size, 4)
+
+
+#
+# Table ordering tests
+#
+
+class VRFTableTestCase(TableTestCases.StandardTableTestCase):
+    table = VRFTable
+
+
+class RouteTargetTableTestCase(TableTestCases.StandardTableTestCase):
+    table = RouteTargetTable
+
+
+class RIRTableTestCase(TableTestCases.StandardTableTestCase):
+    table = RIRTable
+
+
+class AggregateTableTestCase(TableTestCases.StandardTableTestCase):
+    table = AggregateTable
+
+
+class RoleTableTestCase(TableTestCases.StandardTableTestCase):
+    table = RoleTable
+
+
+class PrefixTableTestCase(TableTestCases.StandardTableTestCase):
+    table = PrefixTable
+
+
+class IPRangeTableTestCase(TableTestCases.StandardTableTestCase):
+    table = IPRangeTable
+
+
+class IPAddressTableTestCase(TableTestCases.StandardTableTestCase):
+    table = IPAddressTable
+
+
+class FHRPGroupTableTestCase(TableTestCases.StandardTableTestCase):
+    table = FHRPGroupTable
+
+
+class FHRPGroupAssignmentTableTestCase(TableTestCases.StandardTableTestCase):
+    table = FHRPGroupAssignmentTable
+
+    # No ObjectListView exists for this table; it is only rendered inline on
+    # the FHRPGroup detail view. Provide an explicit queryset source.
+    queryset_sources = [
+        ('FHRPGroupAssignment.objects.all()', FHRPGroupAssignment.objects.all()),
+    ]
+
+
+class VLANGroupTableTestCase(TableTestCases.StandardTableTestCase):
+    table = VLANGroupTable
+
+
+class VLANTableTestCase(TableTestCases.StandardTableTestCase):
+    table = VLANTable
+
+
+class VLANTranslationPolicyTableTestCase(TableTestCases.StandardTableTestCase):
+    table = VLANTranslationPolicyTable
+
+
+class VLANTranslationRuleTableTestCase(TableTestCases.StandardTableTestCase):
+    table = VLANTranslationRuleTable
+
+
+class ASNRangeTableTestCase(TableTestCases.StandardTableTestCase):
+    table = ASNRangeTable
+
+
+class ASNTableTestCase(TableTestCases.StandardTableTestCase):
+    table = ASNTable
+
+    @classmethod
+    def setUpTestData(cls):
+        rir = RIR.objects.create(name='RIR 1', slug='rir-1')
+        asns = (
+            ASN(asn=65001, rir=rir),
+            ASN(asn=65002, rir=rir),
+            ASN(asn=65003, rir=rir),
+        )
+        ASN.objects.bulk_create(asns)
+        cls.sites = (
+            Site(name='Site 1', slug='site-1'),
+            Site(name='Site 2', slug='site-2'),
+        )
+        Site.objects.bulk_create(cls.sites)
+        asns[0].sites.set(cls.sites)
+        asns[1].sites.set(cls.sites[:1])
+
+    @tag('regression')  # Ref: #23350
+    def test_sites_column(self):
+        """The sites column links the sites of each ASN without further queries."""
+        url1, url2 = (site.get_absolute_url() for site in self.sites)
+        table = ASNTable(ASN.objects.all())
+        table.configure(self.get_request())
+        rows = list(table.rows)
+
+        with self.assertNumQueries(0):
+            cells = {row.record.asn: row.get_cell('sites') for row in rows}
+
+        self.assertHTMLEqual(cells[65001], f'<a href="{url1}">Site 1</a>, <a href="{url2}">Site 2</a>')
+        self.assertHTMLEqual(cells[65002], f'<a href="{url1}">Site 1</a>')
+        self.assertEqual(cells[65003], table.columns['sites'].default)
+
+    @tag('regression')  # Ref: #23350
+    def test_sites_export(self):
+        """An export lists the sites of each ASN without further queries."""
+        self.user.config.set('tables.ASNTable.columns', ['asn'], commit=True)
+        table = ASNTable(ASN.objects.all())
+        table.configure(self.get_request())
+        # An "All Data" export prefetches for every column, hidden or not
+        table._apply_prefetching(columns=table.columns.names())
+        rows = list(table.rows)
+
+        with self.assertNumQueries(0):
+            values = {row.record.asn: row.get_cell_value('sites') for row in rows}
+
+        self.assertEqual(values, {65001: 'Site 1, Site 2', 65002: 'Site 1', 65003: None})
+
+
+class ServiceTemplateTableTestCase(TableTestCases.StandardTableTestCase):
+    table = ServiceTemplateTable
+
+
+class ServiceTableTestCase(TableTestCases.StandardTableTestCase):
+    table = ServiceTable

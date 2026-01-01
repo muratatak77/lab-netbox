@@ -1,0 +1,8 @@
+{% extends 'generic/object.html' %}
+{% load i18n %}
+
+{% block title %}{{ object.manufacturer }} {{ object.model }}{% endblock %}
+
+{% block extra_controls %}
+  {% include 'dcim/inc/moduletype_buttons.html' %}
+{% endblock %}

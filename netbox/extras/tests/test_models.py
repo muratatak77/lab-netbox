@@ -1,0 +1,2062 @@
+import io
+import os
+import sys
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
+from django.core.files.base import ContentFile
+from django.core.files.storage import Storage
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import connection
+from django.forms import ValidationError
+from django.test import TestCase, override_settings, tag
+from django.test.utils import CaptureQueriesContext
+from jinja2 import DebugUndefined, StrictUndefined, TemplateError, TemplateSyntaxError, UndefinedError
+from PIL import Image
+from rq.queue import Queue
+
+from core.events import OBJECT_CREATED
+from core.models import AutoSyncRecord, DataSource, ObjectType
+from dcim.models import Device, DeviceRole, DeviceType, Location, Manufacturer, Platform, Region, Site, SiteGroup
+from extras.constants import DEFAULT_MIME_TYPE
+from extras.models import (
+    ConfigContext,
+    ConfigContextProfile,
+    ConfigTemplate,
+    EventRule,
+    ExportTemplate,
+    ImageAttachment,
+    TableConfig,
+    Tag,
+    TaggedItem,
+    Webhook,
+)
+from extras.models.mixins import RenderTemplateMixin
+from tenancy.models import Tenant, TenantGroup
+from utilities.exceptions import AbortRequest
+from utilities.jinja2 import env_filter, render_jinja2, sanitize_http_header
+from utilities.tables import get_table_for_model
+from virtualization.models import Cluster, ClusterGroup, ClusterType, VirtualMachine
+
+
+class OverwriteStyleMemoryStorage(Storage):
+    """
+    In-memory storage that mimics overwrite-style backends by returning the
+    incoming name unchanged from get_available_name().
+    """
+
+    def __init__(self):
+        self.files = {}
+
+    def _open(self, name, mode='rb'):
+        return ContentFile(self.files[name], name=name)
+
+    def _save(self, name, content):
+        self.files[name] = content.read()
+        return name
+
+    def delete(self, name):
+        self.files.pop(name, None)
+
+    def exists(self, name):
+        return name in self.files
+
+    def get_available_name(self, name, max_length=None):
+        return name
+
+    def get_alternative_name(self, file_root, file_ext):
+        return f'{file_root}_sdmmer4{file_ext}'
+
+    def listdir(self, path):
+        return [], list(self.files)
+
+    def size(self, name):
+        return len(self.files[name])
+
+    def url(self, name):
+        return f'https://example.invalid/{name}'
+
+
+class UnreadableSizeMemoryStorage(OverwriteStyleMemoryStorage):
+    """
+    Like OverwriteStyleMemoryStorage, but size() raises OSError to model a storage backend that is
+    transiently unavailable (e.g. an S3 outage) when reading file size.
+    """
+
+    def size(self, name):
+        raise OSError('storage unavailable')
+
+
+class ImageAttachmentTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.ct_rack = ContentType.objects.get_by_natural_key('dcim', 'rack')
+        cls.ct_site = ContentType.objects.get_by_natural_key('dcim', 'site')
+        cls.site = Site.objects.create(name='Site 1')
+        cls.image_content = b''
+
+    def _stub_image_attachment(self, object_id, image_filename, name=None):
+        """
+        Creates an instance of ImageAttachment with the provided object_id and image_name.
+
+        This method prepares a stubbed image attachment to test functionalities that
+        require an ImageAttachment object.
+        The function initializes the attachment with a specified file name and
+        pre-defined image content.
+        """
+        ia = ImageAttachment(
+            object_type=self.ct_rack,
+            object_id=object_id,
+            name=name,
+            image=SimpleUploadedFile(
+                name=image_filename,
+                content=self.image_content,
+                content_type='image/jpeg',
+            ),
+        )
+        return ia
+
+    def _uploaded_png(self, filename):
+        image = io.BytesIO()
+        Image.new('RGB', (1, 1)).save(image, format='PNG')
+        return SimpleUploadedFile(
+            name=filename,
+            content=image.getvalue(),
+            content_type='image/png',
+        )
+
+    def test_filename_strips_expected_prefix(self):
+        """
+        Tests that the filename of the image attachment is stripped of the expected
+        prefix.
+        """
+        ia = self._stub_image_attachment(12, 'image-attachments/rack_12_My_File.png')
+        self.assertEqual(ia.filename, 'My_File.png')
+
+    def test_filename_legacy_nested_path_returns_basename(self):
+        """
+        Tests if the filename of a legacy-nested path correctly returns only the basename.
+        """
+        # e.g. "image-attachments/rack_12_5/31/23.jpg" -> "23.jpg"
+        ia = self._stub_image_attachment(12, 'image-attachments/rack_12_5/31/23.jpg')
+        self.assertEqual(ia.filename, '23.jpg')
+
+    def test_filename_no_prefix_returns_basename(self):
+        """
+        Tests that the filename property correctly returns the basename for an image
+        attachment that has no leading prefix in its path.
+        """
+        ia = self._stub_image_attachment(42, 'image-attachments/just_name.webp')
+        self.assertEqual(ia.filename, 'just_name.webp')
+
+    def test_mismatched_prefix_is_not_stripped(self):
+        """
+        Tests that a mismatched prefix in the filename is not stripped.
+        """
+        # Prefix does not match object_id -> leave as-is (basename only)
+        ia = self._stub_image_attachment(12, 'image-attachments/rack_13_other.png')
+        self.assertEqual('rack_13_other.png', ia.filename)
+
+    def test_str_uses_name_when_present(self):
+        """
+        Tests that the `str` representation of the object uses the
+        `name` attribute when provided.
+        """
+        ia = self._stub_image_attachment(12, 'image-attachments/rack_12_file.png', name='Human title')
+        self.assertEqual('Human title', str(ia))
+
+    def test_str_falls_back_to_filename(self):
+        """
+        Tests that the `str` representation of the object falls back to
+        the filename if the name attribute is not set.
+        """
+        ia = self._stub_image_attachment(12, 'image-attachments/rack_12_file.png', name='')
+        self.assertEqual('file.png', str(ia))
+
+    def test_duplicate_uploaded_names_get_suffixed_with_overwrite_style_storage(self):
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            first = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('action-buttons.png'),
+            )
+            first.save()
+
+            second = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('action-buttons.png'),
+            )
+            second.save()
+
+        base_name = f'image-attachments/site_{self.site.pk}_action-buttons.png'
+        suffixed_name = f'image-attachments/site_{self.site.pk}_action-buttons_sdmmer4.png'
+
+        self.assertEqual(first.image.name, base_name)
+        self.assertEqual(second.image.name, suffixed_name)
+        self.assertNotEqual(first.image.name, second.image.name)
+
+        self.assertEqual(first.filename, 'action-buttons.png')
+        self.assertEqual(second.filename, 'action-buttons_sdmmer4.png')
+
+        self.assertCountEqual(storage.files.keys(), {base_name, suffixed_name})
+
+    def test_save_populates_image_size_on_create(self):
+        """
+        save() populates image_size from the uploaded file on creation.
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('size-on-create.png'),
+            )
+            ia.save()
+
+            self.assertIsNotNone(ia.image_size)
+            self.assertEqual(ia.image_size, ia.image.size)
+
+    def test_size_property_returns_stored_value_without_storage_access(self):
+        """
+        The size property returns the cached image_size rather than the file's actual size. The stub's empty
+        file reports size 0, so asserting the distinct stored value proves the property used the cached value.
+        """
+        ia = self._stub_image_attachment(self.site.pk, 'image-attachments/site_1_no-file.png')
+        self.assertEqual(ia._read_image_size(), 0)  # the stub's empty file genuinely reports 0
+        ia.image_size = 9999
+
+        self.assertEqual(ia.size, 9999)
+
+    def test_size_property_falls_back_to_storage_when_unset(self):
+        """
+        For legacy rows where image_size is NULL, the size property falls back to reading storage
+        (rather than reporting 0 bytes).
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('fallback.png'),
+            )
+            ia.save()
+
+            # Simulate a legacy row that predates the image_size field.
+            ia.image_size = None
+            self.assertEqual(ia.size, ia.image.size)
+            self.assertGreater(ia.size, 0)
+
+    def test_save_does_not_clobber_existing_size_on_storage_error(self):
+        """
+        When the storage backend raises on a size read (modeled by a real Storage subclass, not a mock),
+        save() must not overwrite an existing image_size with None.
+        """
+        field = ImageAttachment._meta.get_field('image')
+
+        # Create a row with a real, readable size.
+        with patch.object(field, 'storage', OverwriteStyleMemoryStorage()):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('keep-size.png'),
+            )
+            ia.save()
+            original_size = ia.image_size
+            self.assertIsNotNone(original_size)
+
+        # Reload from the DB so the FieldFile has no cached size and must consult storage (as it would for a
+        # row loaded fresh in production). With the backend unable to report size, the read fails (returns None),
+        # and save() must keep the previously-stored value rather than clobbering it with None.
+        with patch.object(field, 'storage', UnreadableSizeMemoryStorage()):
+            reloaded = ImageAttachment.objects.get(pk=ia.pk)
+            self.assertIsNone(reloaded._read_image_size())  # the read genuinely fails (returns None)
+            # Make the image look replaced by perturbing the cached identity (different name component).
+            reloaded._orig_image_key = ('image-attachments/site_1_old.png', reloaded.image_height, reloaded.image_width)
+            reloaded.save()
+
+            # In-memory value is preserved, and the persisted value is unchanged.
+            self.assertEqual(reloaded.image_size, original_size)
+            self.assertEqual(ImageAttachment.objects.get(pk=ia.pk).image_size, original_size)
+
+    def test_save_recomputes_image_size_when_image_replaced(self):
+        """
+        Replacing the image on an existing row recomputes image_size (Cable-style change detection).
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('original.png'),
+            )
+            ia.save()
+            original_size = ia.image_size
+            self.assertIsNotNone(original_size)
+
+            # Replace the image with a larger file and save again.
+            larger = SimpleUploadedFile(
+                name='replacement.png',
+                content=self._uploaded_png('replacement.png').read() + b'\x00' * 100,
+                content_type='image/png',
+            )
+            ia.image = larger
+            ia.save()
+
+            self.assertEqual(ia.image_size, ia.image.size)
+            self.assertNotEqual(ia.image_size, original_size)
+
+    def test_image_identity_includes_dimensions(self):
+        """
+        The change-detection key combines the image name with its dimensions, so a replacement that reuses the
+        same name but changes dimensions produces a different key (which name alone would not).
+        """
+        ia = self._stub_image_attachment(self.site.pk, 'image-attachments/site_1_same.png')
+        ia.image_height, ia.image_width = 10, 10
+        key_small = ia._image_identity()
+
+        # Same name, different dimensions (as Django would set when a same-named file is replaced).
+        ia.image_height, ia.image_width = 40, 40
+        key_large = ia._image_identity()
+
+        self.assertEqual(key_small[0], key_large[0])   # name component unchanged
+        self.assertNotEqual(key_small, key_large)      # but the key differs, so save() will recompute
+
+    def test_save_recomputes_image_size_when_dimensions_change_under_same_name(self):
+        """
+        When the image is replaced by a file with the same stored name but different dimensions, save()
+        recomputes image_size. Name-only detection would miss this; the dimension component catches it.
+        Simulates the same-name case by priming the cached identity with the old dimensions.
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('same-name.png'),
+            )
+            ia.save()
+            name = ia.image.name
+
+            # Force the cached identity to reflect the SAME name but different (old) dimensions, then bump the
+            # current dimensions to mimic a same-name replacement with a differently-sized image.
+            ia._orig_image_key = (name, ia.image_height + 5, ia.image_width + 5)
+            ia.save()
+
+            self.assertEqual(ia.image.name, name)                 # name unchanged
+            self.assertEqual(ia.image_size, ia.image.size)        # size recomputed despite same name
+
+    def test_save_without_touching_image_does_not_recompute_or_read_storage(self):
+        """
+        Editing an existing row without replacing the image leaves image_size untouched and does not
+        hit storage. Directly guards against the change-detection comparison misfiring.
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                name='Original',
+                image=self._uploaded_png('untouched.png'),
+            )
+            ia.save()
+            stored_size = ia.image_size
+
+            # Reload from the DB so the cached image identity is set from the persisted value, then edit only the name.
+            reloaded = ImageAttachment.objects.get(pk=ia.pk)
+            reloaded.name = 'Renamed'
+            with patch.object(ImageAttachment, '_read_image_size', side_effect=AssertionError('storage accessed')):
+                reloaded.save()
+
+            self.assertEqual(reloaded.image_size, stored_size)
+
+    def test_save_populates_image_size_via_constructor_kwarg(self):
+        """
+        The non-UI create path (constructor kwarg / REST / bulk) populates image_size correctly,
+        confirming change detection behaves when image is passed as a FieldFile.
+        """
+        storage = OverwriteStyleMemoryStorage()
+        field = ImageAttachment._meta.get_field('image')
+
+        with patch.object(field, 'storage', storage):
+            ia = ImageAttachment(
+                object_type=self.ct_site,
+                object_id=self.site.pk,
+                image=self._uploaded_png('kwarg.png'),
+            )
+            ia.save()
+
+            self.assertIsNotNone(ia.image_size)
+            self.assertEqual(ia.image_size, ia.image.size)
+
+
+class TableConfigTestCase(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.site_ct = ContentType.objects.get_for_model(Site)
+        cls.table_name = get_table_for_model(Site).__name__
+
+    def test_clean_accepts_ordering_none(self):
+        """clean() must accept ordering=None (field is null=True)."""
+        tc = TableConfig(
+            object_type=self.site_ct,
+            table=self.table_name,
+            name='No ordering',
+            columns=['name'],
+            # ordering left unset (defaults to None)
+        )
+        # Must not raise TypeError: 'NoneType' object is not iterable
+        tc.full_clean()
+
+    def test_clean_without_object_type(self):
+        """full_clean() on an instance missing its object type must raise ValidationError."""
+        tc = TableConfig(
+            table=self.table_name,
+            name='No object type',
+            columns=['name'],
+        )
+        with self.assertRaises(ValidationError):
+            tc.full_clean()
+
+    def test_clean_accepts_columns_none(self):
+        """full_clean() must report missing columns rather than raise TypeError."""
+        tc = TableConfig(
+            object_type=self.site_ct,
+            table=self.table_name,
+            name='No columns',
+        )
+        with self.assertRaises(ValidationError):
+            tc.full_clean()
+
+
+class TagTestCase(TestCase):
+
+    def test_default_ordering_weight_then_name_is_set(self):
+        Tag.objects.create(name='Tag 1', slug='tag-1', weight=3000)
+        Tag.objects.create(name='Tag 2', slug='tag-2')  # Default: 1000
+        Tag.objects.create(name='Tag 3', slug='tag-3', weight=2000)
+        Tag.objects.create(name='Tag 4', slug='tag-4', weight=2000)
+
+        tags = Tag.objects.all()
+
+        self.assertEqual(tags[0].slug, 'tag-2')
+        self.assertEqual(tags[1].slug, 'tag-3')
+        self.assertEqual(tags[2].slug, 'tag-4')
+        self.assertEqual(tags[3].slug, 'tag-1')
+
+    def test_tag_related_manager_ordering_weight_then_name(self):
+        tags = [
+            Tag.objects.create(name='Tag 1', slug='tag-1', weight=3000),
+            Tag.objects.create(name='Tag 2', slug='tag-2'),  # Default: 1000
+            Tag.objects.create(name='Tag 3', slug='tag-3', weight=2000),
+            Tag.objects.create(name='Tag 4', slug='tag-4', weight=2000),
+        ]
+
+        site = Site.objects.create(name='Site 1')
+        for _tag in tags:
+            site.tags.add(_tag)
+        site.save()
+
+        site = Site.objects.first()
+        tags = site.tags.all()
+
+        self.assertEqual(tags[0].slug, 'tag-2')
+        self.assertEqual(tags[1].slug, 'tag-3')
+        self.assertEqual(tags[2].slug, 'tag-4')
+        self.assertEqual(tags[3].slug, 'tag-1')
+
+    def test_create_tag_unicode(self):
+        tag = Tag(name='Testing Unicode: 台灣')
+        tag.save()
+
+        self.assertEqual(tag.slug, 'testing-unicode-台灣')
+
+    def test_object_type_validation(self):
+        region = Region.objects.create(name='Region 1', slug='region-1')
+        sitegroup = SiteGroup.objects.create(name='Site Group 1', slug='site-group-1')
+
+        # Create a Tag that can only be applied to Regions
+        tag = Tag.objects.create(name='Tag 1', slug='tag-1')
+        tag.object_types.add(ObjectType.objects.get_by_natural_key('dcim', 'region'))
+
+        # Apply the Tag to a Region
+        region.tags.add(tag)
+        self.assertIn(tag, region.tags.all())
+
+        # Apply the Tag to a SiteGroup
+        with self.assertRaises(AbortRequest):
+            sitegroup.tags.add(tag)
+
+    def test_tag_object_with_64bit_id(self):
+        """
+        Objects whose IDs exceed the 32-bit range can be tagged. Regression test for #23425.
+        """
+        site = Site.objects.create(id=3_000_000_000, name='Site 1', slug='site-1')
+        tag = Tag.objects.create(name='Tag 1', slug='tag-1')
+
+        site.tags.add(tag)
+
+        self.assertEqual(list(Site.objects.get(pk=site.pk).tags.all()), [tag])
+        self.assertEqual(list(Site.objects.filter(tags=tag)), [site])
+
+
+class ConfigContextTestCase(TestCase):
+    """
+    These test cases deal with the weighting, ordering, and deep merge logic of config context data.
+
+    It also ensures the various config context querysets are consistent.
+    """
+    @classmethod
+    def setUpTestData(cls):
+
+        manufacturer = Manufacturer.objects.create(name='Manufacturer 1', slug='manufacturer-1')
+        devicetype = DeviceType.objects.create(manufacturer=manufacturer, model='Device Type 1', slug='device-type-1')
+        role = DeviceRole.objects.create(name='Device Role 1', slug='device-role-1')
+        region = Region.objects.create(name='Region')
+        sitegroup = SiteGroup.objects.create(name='Site Group')
+        site = Site.objects.create(name='Site 1', slug='site-1', region=region, group=sitegroup)
+        location = Location.objects.create(name='Location 1', slug='location-1', site=site)
+        Platform.objects.create(name='Platform')
+        tenantgroup = TenantGroup.objects.create(name='Tenant Group')
+        Tenant.objects.create(name='Tenant', group=tenantgroup)
+        Tag.objects.create(name='Tag', slug='tag')
+        Tag.objects.create(name='Tag2', slug='tag2')
+
+        Device.objects.create(
+            name='Device 1',
+            device_type=devicetype,
+            role=role,
+            site=site,
+            location=location
+        )
+
+    def test_higher_weight_wins(self):
+        device = Device.objects.first()
+        context1 = ConfigContext(
+            name="context 1",
+            weight=101,
+            data={
+                "a": 123,
+                "b": 456,
+                "c": 777
+            }
+        )
+        context2 = ConfigContext(
+            name="context 2",
+            weight=100,
+            data={
+                "a": 123,
+                "b": 456,
+                "c": 789
+            }
+        )
+        ConfigContext.objects.bulk_create([context1, context2])
+
+        expected_data = {
+            "a": 123,
+            "b": 456,
+            "c": 777
+        }
+        self.assertEqual(device.get_config_context(), expected_data)
+
+    def test_name_ordering_after_weight(self):
+        device = Device.objects.first()
+        context1 = ConfigContext(
+            name="context 1",
+            weight=100,
+            data={
+                "a": 123,
+                "b": 456,
+                "c": 777
+            }
+        )
+        context2 = ConfigContext(
+            name="context 2",
+            weight=100,
+            data={
+                "a": 123,
+                "b": 456,
+                "c": 789
+            }
+        )
+        ConfigContext.objects.bulk_create([context1, context2])
+
+        expected_data = {
+            "a": 123,
+            "b": 456,
+            "c": 789
+        }
+        self.assertEqual(device.get_config_context(), expected_data)
+
+    def test_schema_validation(self):
+        """
+        Check that the JSON schema defined by the assigned profile is enforced.
+        """
+        profile = ConfigContextProfile.objects.create(
+            name="Config context profile 1",
+            schema={
+                "properties": {
+                    "foo": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "foo"
+                ]
+            }
+        )
+
+        with self.assertRaises(ValidationError):
+            # Missing required attribute
+            ConfigContext(name="CC1", profile=profile, data={}).clean()
+        with self.assertRaises(ValidationError):
+            # Invalid attribute type
+            ConfigContext(name="CC1", profile=profile, data={"foo": 123}).clean()
+        ConfigContext(name="CC1", profile=profile, data={"foo": "bar"}).clean()
+
+    def test_annotation_same_as_get_for_object(self):
+        """
+        This test incorporates features from all of the above tests cases to ensure
+        the annotate_config_context_data() and get_for_object() queryset methods are the same.
+        """
+        device = Device.objects.first()
+        context1 = ConfigContext(
+            name="context 1",
+            weight=101,
+            data={
+                "a": 123,
+                "b": 456,
+                "c": 777
+            }
+        )
+        context2 = ConfigContext(
+            name="context 2",
+            weight=100,
+            data={
+                "a": 123,
+                "b": 456,
+                "c": 789
+            }
+        )
+        context3 = ConfigContext(
+            name="context 3",
+            weight=99,
+            data={
+                "d": 1
+            }
+        )
+        context4 = ConfigContext(
+            name="context 4",
+            weight=99,
+            data={
+                "d": 2
+            }
+        )
+        ConfigContext.objects.bulk_create([context1, context2, context3, context4])
+
+        annotated_queryset = Device.objects.filter(name=device.name).annotate_config_context_data()
+        self.assertEqual(device.get_config_context(), annotated_queryset[0].get_config_context())
+
+    def test_annotation_same_as_get_for_object_device_relations(self):
+        region = Region.objects.first()
+        sitegroup = SiteGroup.objects.first()
+        site = Site.objects.first()
+        location = Location.objects.first()
+        platform = Platform.objects.first()
+        tenantgroup = TenantGroup.objects.first()
+        tenant = Tenant.objects.first()
+        tag = Tag.objects.first()
+
+        region_context = ConfigContext.objects.create(
+            name="region",
+            weight=100,
+            data={
+                "region": 1
+            }
+        )
+        region_context.regions.add(region)
+
+        sitegroup_context = ConfigContext.objects.create(
+            name="sitegroup",
+            weight=100,
+            data={
+                "sitegroup": 1
+            }
+        )
+        sitegroup_context.site_groups.add(sitegroup)
+
+        site_context = ConfigContext.objects.create(
+            name="site",
+            weight=100,
+            data={
+                "site": 1
+            }
+        )
+        site_context.sites.add(site)
+
+        location_context = ConfigContext.objects.create(
+            name="location",
+            weight=100,
+            data={
+                "location": 1
+            }
+        )
+        location_context.locations.add(location)
+
+        platform_context = ConfigContext.objects.create(
+            name="platform",
+            weight=100,
+            data={
+                "platform": 1
+            }
+        )
+        platform_context.platforms.add(platform)
+
+        tenant_group_context = ConfigContext.objects.create(
+            name="tenant group",
+            weight=100,
+            data={
+                "tenant_group": 1
+            }
+        )
+        tenant_group_context.tenant_groups.add(tenantgroup)
+
+        tenant_context = ConfigContext.objects.create(
+            name="tenant",
+            weight=100,
+            data={
+                "tenant": 1
+            }
+        )
+        tenant_context.tenants.add(tenant)
+
+        tag_context = ConfigContext.objects.create(
+            name="tag",
+            weight=100,
+            data={
+                "tag": 1
+            }
+        )
+        tag_context.tags.add(tag)
+
+        device = Device.objects.create(
+            name="Device 2",
+            site=site,
+            location=location,
+            tenant=tenant,
+            platform=platform,
+            role=DeviceRole.objects.first(),
+            device_type=DeviceType.objects.first()
+        )
+        device.tags.add(tag)
+
+        annotated_queryset = Device.objects.filter(name=device.name).annotate_config_context_data()
+        self.assertEqual(device.get_config_context(), annotated_queryset[0].get_config_context())
+
+    def test_annotation_same_as_get_for_object_virtualmachine_relations(self):
+        region = Region.objects.first()
+        sitegroup = SiteGroup.objects.first()
+        site = Site.objects.first()
+        platform = Platform.objects.first()
+        tenantgroup = TenantGroup.objects.first()
+        tenant = Tenant.objects.first()
+        tag = Tag.objects.first()
+        cluster_type = ClusterType.objects.create(name="Cluster Type")
+        cluster_group = ClusterGroup.objects.create(name="Cluster Group")
+        cluster = Cluster.objects.create(
+            name="Cluster",
+            group=cluster_group,
+            type=cluster_type,
+            scope=site,
+        )
+
+        region_context = ConfigContext.objects.create(
+            name="region",
+            weight=100,
+            data={"region": 1}
+        )
+        region_context.regions.add(region)
+
+        sitegroup_context = ConfigContext.objects.create(
+            name="sitegroup",
+            weight=100,
+            data={"sitegroup": 1}
+        )
+        sitegroup_context.site_groups.add(sitegroup)
+
+        site_context = ConfigContext.objects.create(
+            name="site",
+            weight=100,
+            data={"site": 1}
+        )
+        site_context.sites.add(site)
+
+        platform_context = ConfigContext.objects.create(
+            name="platform",
+            weight=100,
+            data={"platform": 1}
+        )
+        platform_context.platforms.add(platform)
+
+        tenant_group_context = ConfigContext.objects.create(
+            name="tenant group",
+            weight=100,
+            data={"tenant_group": 1}
+        )
+        tenant_group_context.tenant_groups.add(tenantgroup)
+
+        tenant_context = ConfigContext.objects.create(
+            name="tenant",
+            weight=100,
+            data={"tenant": 1}
+        )
+        tenant_context.tenants.add(tenant)
+
+        tag_context = ConfigContext.objects.create(
+            name="tag",
+            weight=100,
+            data={"tag": 1}
+        )
+        tag_context.tags.add(tag)
+
+        cluster_type_context = ConfigContext.objects.create(
+            name="cluster type",
+            weight=100,
+            data={"cluster_type": 1}
+        )
+        cluster_type_context.cluster_types.add(cluster_type)
+
+        cluster_group_context = ConfigContext.objects.create(
+            name="cluster group",
+            weight=100,
+            data={"cluster_group": 1}
+        )
+        cluster_group_context.cluster_groups.add(cluster_group)
+
+        cluster_context = ConfigContext.objects.create(
+            name="cluster",
+            weight=100,
+            data={"cluster": 1}
+        )
+        cluster_context.clusters.add(cluster)
+
+        virtual_machine = VirtualMachine.objects.create(
+            name="VM 1",
+            cluster=cluster,
+            tenant=tenant,
+            platform=platform,
+            role=DeviceRole.objects.first()
+        )
+        virtual_machine.tags.add(tag)
+
+        annotated_queryset = VirtualMachine.objects.filter(name=virtual_machine.name).annotate_config_context_data()
+        self.assertEqual(virtual_machine.get_config_context(), annotated_queryset[0].get_config_context())
+
+    def test_virtualmachine_site_context(self):
+        """
+        Check that config context associated with a site applies to a VM whether the VM is assigned
+        directly to that site or via its cluster.
+        """
+        site = Site.objects.first()
+        cluster_type = ClusterType.objects.create(name="Cluster Type")
+        cluster = Cluster.objects.create(name="Cluster", type=cluster_type, scope=site)
+        vm_role = DeviceRole.objects.first()
+
+        # Create a ConfigContext associated with the site
+        context = ConfigContext.objects.create(
+            name="context1",
+            weight=100,
+            data={"foo": True}
+        )
+        context.sites.add(site)
+
+        # Create one VM assigned directly to the site, and one assigned via the cluster
+        vm1 = VirtualMachine.objects.create(name="VM 1", site=site, role=vm_role)
+        vm2 = VirtualMachine.objects.create(name="VM 2", cluster=cluster, role=vm_role)
+
+        # Check that their individually rendered config contexts are identical
+        self.assertEqual(
+            vm1.get_config_context(),
+            vm2.get_config_context()
+        )
+
+        # Check that their annotated config contexts are identical
+        vms = VirtualMachine.objects.filter(pk__in=(vm1.pk, vm2.pk)).annotate_config_context_data()
+        self.assertEqual(
+            vms[0].get_config_context(),
+            vms[1].get_config_context()
+        )
+
+    def test_valid_local_context_data(self):
+        device = Device.objects.first()
+        device.local_context_data = None
+        device.clean()
+
+        device.local_context_data = {"foo": "bar"}
+        device.clean()
+
+    def test_invalid_local_context_data(self):
+        device = Device.objects.first()
+
+        device.local_context_data = ""
+        with self.assertRaises(ValidationError):
+            device.clean()
+
+        device.local_context_data = 0
+        with self.assertRaises(ValidationError):
+            device.clean()
+
+        device.local_context_data = False
+        with self.assertRaises(ValidationError):
+            device.clean()
+
+        device.local_context_data = 'foo'
+        with self.assertRaises(ValidationError):
+            device.clean()
+
+    @tag('regression')
+    def test_multiple_tags_return_distinct_objects(self):
+        """
+        Tagged items use a generic relationship, which results in duplicate rows being returned when queried.
+        This is combated by appending distinct() to the config context querysets. This test creates a config
+        context assigned to two tags and ensures objects related to those same two tags result in only a single
+        config context record being returned.
+
+        See https://github.com/netbox-community/netbox/issues/5314
+        """
+        site = Site.objects.first()
+        platform = Platform.objects.first()
+        tenant = Tenant.objects.first()
+        tags = Tag.objects.all()
+
+        tag_context = ConfigContext.objects.create(
+            name="tag",
+            weight=100,
+            data={
+                "tag": 1
+            }
+        )
+        tag_context.tags.set(tags)
+
+        device = Device.objects.create(
+            name="Device 3",
+            site=site,
+            tenant=tenant,
+            platform=platform,
+            role=DeviceRole.objects.first(),
+            device_type=DeviceType.objects.first()
+        )
+        device.tags.set(tags)
+
+        annotated_queryset = Device.objects.filter(name=device.name).annotate_config_context_data()
+        self.assertEqual(ConfigContext.objects.get_for_object(device).count(), 1)
+        self.assertEqual(device.get_config_context(), annotated_queryset[0].get_config_context())
+
+    @tag('regression')
+    def test_multiple_tags_return_distinct_objects_with_separate_config_contexts(self):
+        """
+        Tagged items use a generic relationship, which results in duplicate rows being returned when queried.
+        This is combated by appending distinct() to the config context querysets. This test creates a config
+        context assigned to two tags and ensures objects related to those same two tags result in only a single
+        config context record being returned.
+
+        This test case is separate from the above in that it deals with multiple config context objects in play.
+
+        See https://github.com/netbox-community/netbox/issues/5387
+        """
+        site = Site.objects.first()
+        platform = Platform.objects.first()
+        tenant = Tenant.objects.first()
+        tag1, tag2 = list(Tag.objects.all())
+
+        tag_context_1 = ConfigContext.objects.create(
+            name="tag-1",
+            weight=100,
+            data={
+                "tag": 1
+            }
+        )
+        tag_context_1.tags.add(tag1)
+
+        tag_context_2 = ConfigContext.objects.create(
+            name="tag-2",
+            weight=100,
+            data={
+                "tag": 1
+            }
+        )
+        tag_context_2.tags.add(tag2)
+
+        device = Device.objects.create(
+            name="Device 3",
+            site=site,
+            tenant=tenant,
+            platform=platform,
+            role=DeviceRole.objects.first(),
+            device_type=DeviceType.objects.first()
+        )
+        device.tags.set([tag1, tag2])
+
+        annotated_queryset = Device.objects.filter(name=device.name).annotate_config_context_data()
+        self.assertEqual(ConfigContext.objects.get_for_object(device).count(), 2)
+        self.assertEqual(device.get_config_context(), annotated_queryset[0].get_config_context())
+
+    @tag('performance', 'regression')
+    def test_config_context_annotation_query_optimization(self):
+        """
+        Regression test for issue #20327: Ensure config context annotation
+        doesn't use expensive DISTINCT on main query.
+
+        Verifies that DISTINCT is only used in tag subquery where needed,
+        not on the main device query which is expensive for large datasets.
+        """
+        device = Device.objects.first()
+        queryset = Device.objects.filter(pk=device.pk).annotate_config_context_data()
+
+        # Main device query should NOT use DISTINCT
+        self.assertFalse(queryset.query.distinct)
+
+        # Check that tag subqueries DO use DISTINCT by inspecting the annotation
+        config_annotation = queryset.query.annotations.get('config_context_data')
+        self.assertIsNotNone(config_annotation)
+
+        def find_tag_subqueries(where_node):
+            """Find subqueries in WHERE clause that relate to tag filtering"""
+            subqueries = []
+
+            def traverse(node):
+                if hasattr(node, 'children'):
+                    for child in node.children:
+                        try:
+                            # In Django 6.0+, rhs is a Query directly; older Django wraps it in Subquery
+                            rhs_query = getattr(child.rhs, 'query', child.rhs)
+                            if rhs_query.model is TaggedItem:
+                                subqueries.append(rhs_query)
+                        except AttributeError:
+                            traverse(child)
+            traverse(where_node)
+            return subqueries
+
+        # In Django 6.0+, the annotation is a Query directly; older Django wraps it in Subquery
+        annotation_query = getattr(config_annotation, 'query', config_annotation)
+        # Find subqueries in the WHERE clause that should have DISTINCT
+        tag_subqueries = find_tag_subqueries(annotation_query.where)
+        distinct_subqueries = [sq for sq in tag_subqueries if sq.distinct]
+
+        # Verify we found at least one DISTINCT subquery for tags
+        self.assertEqual(len(distinct_subqueries), 1)
+        self.assertTrue(distinct_subqueries[0].distinct)
+
+
+class ConfigTemplateTestCase(TestCase):
+    """
+    TODO: These test cases deal with the weighting, ordering, and deep merge logic of config context data.
+    """
+    MAIN_TEMPLATE = """
+    {%- include 'base.j2' %}
+    """.strip()
+    BASE_TEMPLATE = """
+    Hi
+    """.strip()
+
+    @classmethod
+    def _create_template_file(cls, templates_dir, file_name, content):
+        template_file_name = file_name
+        if not template_file_name.endswith('j2'):
+            template_file_name += '.j2'
+        temp_file_path = templates_dir / template_file_name
+
+        with open(temp_file_path, 'w') as f:
+            f.write(content)
+
+    @classmethod
+    def setUpTestData(cls):
+        temp_dir = tempfile.TemporaryDirectory()
+        templates_dir = Path(temp_dir.name) / "templates"
+        templates_dir.mkdir(parents=True, exist_ok=True)
+
+        cls._create_template_file(templates_dir, 'base.j2', cls.BASE_TEMPLATE)
+        cls._create_template_file(templates_dir, 'main.j2', cls.MAIN_TEMPLATE)
+
+        data_source = DataSource(
+            name="Test DataSource",
+            type="local",
+            source_url=str(templates_dir),
+        )
+        data_source.save()
+        data_source.sync()
+
+        base_config_template = ConfigTemplate(
+            name="BaseTemplate",
+            data_file=data_source.datafiles.filter(path__endswith='base.j2').first()
+        )
+        base_config_template.clean()
+        base_config_template.save()
+        cls.base_config_template = base_config_template
+
+        main_config_template = ConfigTemplate(
+            name="MainTemplate",
+            data_file=data_source.datafiles.filter(path__endswith='main.j2').first()
+        )
+        main_config_template.clean()
+        main_config_template.save()
+        cls.main_config_template = main_config_template
+
+    @tag('regression')
+    def test_config_template_with_data_source(self):
+        self.assertEqual(self.BASE_TEMPLATE, self.base_config_template.render({}))
+
+    @tag('regression')
+    def test_config_template_with_data_source_nested_templates(self):
+        self.assertEqual(self.BASE_TEMPLATE, self.main_config_template.render({}))
+
+    @tag('regression')
+    def test_autosyncrecord_cleanup_on_detach(self):
+        """Test that AutoSyncRecord is deleted when detaching from DataSource."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            templates_dir = Path(temp_dir) / "templates"
+            templates_dir.mkdir(parents=True, exist_ok=True)
+
+            self._create_template_file(templates_dir, 'test.j2', 'Test content')
+
+            data_source = DataSource(
+                name="Test DataSource for Detach",
+                type="local",
+                source_url=str(templates_dir),
+            )
+            data_source.save()
+            data_source.sync()
+
+            data_file = data_source.datafiles.filter(path__endswith='test.j2').first()
+
+            # Create a ConfigTemplate with data_file and auto_sync_enabled
+            config_template = ConfigTemplate(
+                name="TestTemplateForDetach",
+                data_file=data_file,
+                auto_sync_enabled=True
+            )
+            config_template.clean()
+            config_template.save()
+
+            # Verify AutoSyncRecord was created
+            object_type = ObjectType.objects.get_for_model(ConfigTemplate)
+            autosync_records = AutoSyncRecord.objects.filter(
+                object_type=object_type,
+                object_id=config_template.pk
+            )
+            self.assertEqual(autosync_records.count(), 1, "AutoSyncRecord should be created")
+
+            # Detach from DataSource
+            config_template.data_file = None
+            config_template.data_source = None
+            config_template.auto_sync_enabled = False
+            config_template.clean()
+            config_template.save()
+
+            # Verify AutoSyncRecord was deleted
+            autosync_records = AutoSyncRecord.objects.filter(
+                object_type=object_type,
+                object_id=config_template.pk
+            )
+            self.assertEqual(autosync_records.count(), 0, "AutoSyncRecord should be deleted after detaching")
+
+
+class ConfigTemplateDebugTestCase(TestCase):
+    """
+    Tests for the ConfigTemplate debug field and its effect on template rendering error output.
+    """
+
+    def _make_template(self, template_code, debug=False):
+        t = ConfigTemplate(
+            name=f"DebugTestTemplate-{debug}",
+            template_code=template_code,
+            debug=debug,
+        )
+        t.save()
+        return t
+
+    def test_debug_default_is_false(self):
+        t = ConfigTemplate(name="t", template_code="hello")
+        self.assertFalse(t.debug)
+
+    def test_template_error_non_debug_no_traceback(self):
+        """In non-debug mode, a TemplateError raises with no traceback exposure."""
+        t = self._make_template("{{ unclosed", debug=False)
+        with self.assertRaises(TemplateError):
+            t.render({})
+
+    def test_template_error_debug_mode_raises(self):
+        """In debug mode, a TemplateError still raises (callers handle display)."""
+        t = self._make_template("{{ unclosed", debug=True)
+        with self.assertRaises(TemplateError):
+            t.render({})
+
+    def test_render_jinja2_debug_extension_enabled(self):
+        """When debug=True, the Jinja2 debug extension is loaded in the environment."""
+        # The {% debug %} tag is only available when the debug extension is loaded.
+        output = render_jinja2("{% debug %}", {}, debug=True)
+        self.assertIsInstance(output, str)
+
+    def test_render_jinja2_debug_extension_not_loaded_by_default(self):
+        """When debug=False, the {% debug %} tag is not available."""
+        with self.assertRaises(TemplateSyntaxError):
+            render_jinja2("{% debug %}", {}, debug=False)
+
+    def test_format_render_error_debug_redacts_install_path(self):
+        """format_render_error() strips the repo install-path prefix from debug tracebacks."""
+        t = ConfigTemplate(name='redact-test', template_code='hello', debug=True)
+        try:
+            raise ValueError("deliberate test error")
+        except ValueError as exc:
+            result = t.format_render_error(exc)
+        install_root = os.path.dirname(settings.BASE_DIR) + os.sep
+        self.assertIn('Traceback', result)
+        self.assertNotIn(install_root, result)
+        # Also verify the venv prefix is stripped when running inside a virtualenv.
+        if sys.prefix != sys.base_prefix:
+            venv_root = sys.prefix + os.sep
+            if venv_root != install_root:
+                self.assertNotIn(venv_root, result)
+
+    def test_format_render_error_non_debug_returns_concise_message(self):
+        """format_render_error() returns a one-line message (no traceback) when debug=False."""
+        t = ConfigTemplate(name='nodebug-test', template_code='hello', debug=False)
+        try:
+            raise TemplateError("bad template")
+        except TemplateError as exc:
+            result = t.format_render_error(exc)
+        self.assertNotIn('Traceback', result)
+        self.assertIn('TemplateError', result)
+
+
+class JinjaEnvFilterTestCase(TestCase):
+    """
+    Tests for the env() Jinja2 filter and the JINJA_ENVIRONMENT_PARAMS configuration parameter.
+    """
+
+    def test_env_filter_returns_value_for_matching_name(self):
+        with patch.dict('os.environ', {'NETBOX_TEST_TOKEN': 'secret'}, clear=False), \
+                self.settings(JINJA_ENVIRONMENT_PARAMS=['NETBOX_TEST_TOKEN']):
+            self.assertEqual(env_filter('NETBOX_TEST_TOKEN'), 'secret')
+
+    def test_env_filter_returns_none_for_unmatched_name(self):
+        with patch.dict('os.environ', {'NETBOX_OTHER_TOKEN': 'secret'}, clear=False), \
+                self.settings(JINJA_ENVIRONMENT_PARAMS=['NETBOX_TEST_TOKEN']):
+            self.assertIsNone(env_filter('NETBOX_OTHER_TOKEN'))
+
+    def test_env_filter_wildcard_match(self):
+        with patch.dict('os.environ', {'NETBOX_TEST_TOKEN_1': 'one', 'NETBOX_TEST_TOKEN_2': 'two'}, clear=False), \
+                self.settings(JINJA_ENVIRONMENT_PARAMS=['NETBOX_TEST_TOKEN_*']):
+            self.assertEqual(env_filter('NETBOX_TEST_TOKEN_1'), 'one')
+            self.assertEqual(env_filter('NETBOX_TEST_TOKEN_2'), 'two')
+
+    def test_env_filter_returns_none_for_missing_env_var(self):
+        with self.settings(JINJA_ENVIRONMENT_PARAMS=['NETBOX_MISSING_VAR']):
+            self.assertIsNone(env_filter('NETBOX_MISSING_VAR'))
+
+    def test_env_filter_empty_whitelist_returns_none(self):
+        with patch.dict('os.environ', {'NETBOX_TEST_TOKEN': 'secret'}, clear=False), \
+                self.settings(JINJA_ENVIRONMENT_PARAMS=[]):
+            self.assertIsNone(env_filter('NETBOX_TEST_TOKEN'))
+
+    def test_env_filter_registered_by_default(self):
+        with patch.dict('os.environ', {'NETBOX_TEST_TOKEN': 'secret'}, clear=False), \
+                self.settings(JINJA_ENVIRONMENT_PARAMS=['NETBOX_TEST_TOKEN']):
+            output = render_jinja2("{{ 'NETBOX_TEST_TOKEN' | env }}", {})
+            self.assertEqual(output, 'secret')
+
+    def test_user_defined_filter_overrides_default(self):
+        with self.settings(JINJA_FILTERS={'env': lambda name: 'overridden'}):
+            output = render_jinja2("{{ 'NETBOX_TEST_TOKEN' | env }}", {})
+            self.assertEqual(output, 'overridden')
+
+
+class SanitizeHTTPHeaderFilterTestCase(TestCase):
+    """
+    Tests for the sanitize_http_header() Jinja2 filter (exposed as `header_safe`) and the render_jinja2()
+    `filters` argument used to make it available.
+    """
+
+    def test_strips_crlf(self):
+        self.assertEqual(sanitize_http_header('legit\r\nX-Injected: evil'), 'legitX-Injected: evil')
+
+    def test_strips_control_characters(self):
+        self.assertEqual(sanitize_http_header('foo\x00\x1f\x7fbar'), 'foobar')
+
+    def test_preserves_normal_value(self):
+        self.assertEqual(sanitize_http_header('application/json'), 'application/json')
+
+    def test_coerces_non_string(self):
+        self.assertEqual(sanitize_http_header(42), '42')
+
+    def test_available_via_render_filters_argument(self):
+        output = render_jinja2(
+            "{{ value | header_safe }}",
+            {'value': 'a\r\nb'},
+            filters={'header_safe': sanitize_http_header},
+        )
+        self.assertEqual(output, 'ab')
+
+    def test_render_filters_take_precedence_over_user_config(self):
+        # A per-render filter cannot be shadowed by a user-configured filter of the same name
+        with self.settings(JINJA_FILTERS={'header_safe': lambda v: 'shadowed'}):
+            output = render_jinja2(
+                "{{ value | header_safe }}",
+                {'value': 'a\r\nb'},
+                filters={'header_safe': sanitize_http_header},
+            )
+            self.assertEqual(output, 'ab')
+
+    def test_not_registered_without_filters_argument(self):
+        # The filter must not leak into general-purpose rendering
+        with self.assertRaises(TemplateError):
+            render_jinja2("{{ 'x' | header_safe }}", {})
+
+
+class ExportTemplateContextTestCase(TestCase):
+    """
+    Tests for ExportTemplate.get_context() including public model population.
+    """
+
+    def test_get_context_includes_public_models(self):
+        et = ExportTemplate(name='test', template_code='test')
+        ctx = et.get_context()
+
+        self.assertIs(ctx['dcim']['Site'], Site)
+        self.assertIs(ctx['dcim']['Device'], Device)
+
+    def test_get_context_includes_queryset(self):
+        et = ExportTemplate(name='test', template_code='test')
+        qs = Site.objects.all()
+        ctx = et.get_context(queryset=qs)
+
+        self.assertIs(ctx['queryset'], qs)
+
+    def test_get_context_applies_extra_context(self):
+        et = ExportTemplate(name='test', template_code='test')
+        ctx = et.get_context(context={'custom_key': 'custom_value'})
+
+        self.assertEqual(ctx['custom_key'], 'custom_value')
+        self.assertIs(ctx['dcim']['Site'], Site)
+
+    def test_config_template_get_context_includes_public_models(self):
+        ct = ConfigTemplate(name='test', template_code='test')
+        ctx = ct.get_context()
+
+        self.assertIs(ctx['dcim']['Site'], Site)
+
+
+def finalize_none_to_dash(value):
+    """
+    Module-level helper used by RenderTemplateMixinRenderTestCase.test_environment_params_finalize_path_import.
+    Exported so it can be referenced by dotted path from a Jinja environment_params value.
+    """
+    return '-' if value is None else value
+
+
+class RenderTemplateMixinRenderTestCase(TestCase):
+    """
+    Tests for RenderTemplateMixin.render() and get_environment_params(), exercised via ConfigTemplate.
+    """
+
+    def test_render_basic_context(self):
+        t = ConfigTemplate(name='basic', template_code='Hello {{ name }}')
+        self.assertEqual(t.render({'name': 'world'}), 'Hello world')
+
+    def test_render_normalizes_crlf(self):
+        t = ConfigTemplate(name='crlf', template_code='line1\r\nline2\r\nline3')
+        self.assertEqual(t.render({}), 'line1\nline2\nline3')
+
+    def test_render_passes_environment_params(self):
+        # With trim_blocks + lstrip_blocks, block tags don't emit their surrounding whitespace.
+        template_code = '{% if x %}\n    {% if y %}\n        VALUE\n    {% endif %}\n{% endif %}'
+        plain = ConfigTemplate(name='plain', template_code=template_code)
+        trimmed = ConfigTemplate(
+            name='trimmed',
+            template_code=template_code,
+            environment_params={'trim_blocks': True, 'lstrip_blocks': True},
+        )
+        ctx = {'x': True, 'y': True}
+        self.assertNotEqual(plain.render(ctx), trimmed.render(ctx))
+        self.assertEqual(trimmed.render(ctx).strip(), 'VALUE')
+
+    def test_configtemplate_autoescape_always_disabled(self):
+        """
+        ConfigTemplate renders plain text (network configs, scripts); autoescape must stay off
+        even if environment_params explicitly requests it (#22652).
+        """
+        t = ConfigTemplate(name='autoescape', template_code='{{ value }}', environment_params={'autoescape': True})
+        self.assertEqual(t.render({'value': '<script>'}), '<script>')
+
+    def test_exporttemplate_autoescape_is_configurable(self):
+        """
+        Unlike ConfigTemplate, ExportTemplate output may legitimately be HTML, so an explicit
+        autoescape=True in environment_params must be honored rather than forced off.
+        """
+        et = ExportTemplate(
+            name='autoescape', template_code='{{ value }}', environment_params={'autoescape': True}
+        )
+        self.assertEqual(et.render({'value': '<script>'}), '&lt;script&gt;')
+
+    def test_environment_params_undefined_path_import(self):
+        # Default Undefined renders nothing for a missing variable.
+        default = ConfigTemplate(name='default', template_code='{{ missing }}')
+        self.assertEqual(default.render({}), '')
+
+        # StrictUndefined (resolved from its dotted path) raises on access.
+        strict = ConfigTemplate(
+            name='strict',
+            template_code='{{ missing }}',
+            environment_params={'undefined': 'jinja2.StrictUndefined'},
+        )
+        with self.assertRaises(UndefinedError):
+            strict.render({})
+
+    def test_environment_params_stored_finalize_resolution(self):
+        """
+        A stored 'finalize' value still resolves via import_string(). clean() blocks new use (CVE-2026-29514).
+        """
+        # create() does not call clean(). This matches a value stored before clean() blocked it.
+        t = ConfigTemplate.objects.create(
+            name='finalize',
+            template_code='{{ v }}',
+            environment_params={'finalize': 'extras.tests.test_models.finalize_none_to_dash'},
+        )
+        self.assertEqual(t.render({'v': None}), '-')
+        self.assertEqual(t.render({'v': 'abc'}), 'abc')
+
+    def test_get_environment_params_handles_none(self):
+        # The environment_params field may be cleared; ensure the mixin returns a dict (not None).
+        # ConfigTemplate always forces autoescape off (#22652).
+        t = ConfigTemplate(name='empty', template_code='ok', environment_params=None)
+        self.assertEqual(t.get_environment_params(), {'autoescape': False})
+
+    def test_get_environment_params_resolves_path_imports(self):
+        t = ConfigTemplate(
+            name='resolve',
+            template_code='ok',
+            environment_params={'undefined': 'jinja2.StrictUndefined', 'trim_blocks': True},
+        )
+        params = t.get_environment_params()
+        self.assertIs(params['undefined'], StrictUndefined)
+        self.assertIs(params['trim_blocks'], True)
+
+    def test_get_environment_params_does_not_mutate_field(self):
+        # Resolving path imports must not replace the string values stored on the model field.
+        t = ConfigTemplate(
+            name='no-mutate',
+            template_code='ok',
+            environment_params={'undefined': 'jinja2.StrictUndefined'},
+        )
+        t.get_environment_params()
+        t.get_environment_params()
+        self.assertEqual(t.environment_params, {'undefined': 'jinja2.StrictUndefined'})
+
+
+class RenderTemplateMixinResponseTestCase(TestCase):
+    """
+    Tests for RenderTemplateMixin.render_to_response() HTTP behavior.
+    """
+
+    def test_response_default_mime_type(self):
+        t = ConfigTemplate(name='t', template_code='ok')
+        response = t.render_to_response({})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], DEFAULT_MIME_TYPE)
+
+    def test_response_custom_mime_type(self):
+        t = ConfigTemplate(name='t', template_code='{}', mime_type='application/json')
+        response = t.render_to_response({})
+        self.assertEqual(response['Content-Type'], 'application/json')
+
+    def test_response_attachment_with_file_name(self):
+        t = ConfigTemplate(
+            name='t', template_code='ok', file_name='router1', file_extension='cfg', as_attachment=True,
+        )
+        response = t.render_to_response({})
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="router1.cfg"')
+
+    def test_response_attachment_filename_from_queryset(self):
+        Site.objects.create(name='Site 1', slug='site-1')
+        t = ExportTemplate(
+            name='t',
+            template_code='{% for obj in queryset %}{{ obj.name }}{% endfor %}',
+            file_extension='txt',
+            as_attachment=True,
+        )
+        response = t.render_to_response(queryset=Site.objects.all())
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="netbox_sites.txt"')
+
+    def test_response_attachment_filename_from_empty_queryset(self):
+        """An empty (but non-None) queryset must still yield a model-derived filename."""
+        t = ExportTemplate(
+            name='t',
+            template_code='{% for obj in queryset %}{{ obj.name }}{% endfor %}',
+            file_extension='txt',
+            as_attachment=True,
+        )
+        response = t.render_to_response(queryset=Site.objects.none())
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="netbox_sites.txt"')
+
+    def test_response_attachment_does_not_force_queryset_evaluation(self):
+        """A template that never references `queryset` must not force it to be evaluated."""
+        Site.objects.bulk_create([Site(name=f'Site {i}', slug=f'site-{i}') for i in range(5)])
+        t = ExportTemplate(
+            name='t',
+            template_code='static output',  # deliberately does not reference `queryset`
+            file_extension='txt',
+            as_attachment=True,
+        )
+        with CaptureQueriesContext(connection) as ctx:
+            t.render_to_response(queryset=Site.objects.all())
+
+        table = Site._meta.db_table
+        site_queries = [q for q in ctx.captured_queries if table in q['sql']]
+        self.assertEqual(
+            site_queries, [],
+            f"render_to_response() queried {table} even though the template never "
+            f"references `queryset`:\n{site_queries}"
+        )
+
+    def test_response_attachment_filename_from_device_context(self):
+        t = ConfigTemplate(name='t', template_code='ok', as_attachment=True)
+        device = SimpleNamespace(name='router1')
+        response = t.render_to_response(context={'device': device})
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="router1"')
+
+    def test_response_attachment_fallback_filename(self):
+        # No file_name, no queryset, no device/vm key in context: filename falls back to "output".
+        t = ConfigTemplate(name='t', template_code='ok', as_attachment=True)
+        response = t.render_to_response({})
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="output"')
+
+    def test_response_as_attachment_false_omits_disposition(self):
+        t = ConfigTemplate(name='t', template_code='ok', file_name='router1', as_attachment=False)
+        response = t.render_to_response({})
+        self.assertNotIn('Content-Disposition', response)
+
+    def test_response_body_matches_render(self):
+        t = ConfigTemplate(name='t', template_code='Hello {{ name }}')
+        rendered = t.render({'name': 'world'})
+        response = t.render_to_response({'name': 'world'})
+        self.assertEqual(response.content.decode(), rendered)
+
+
+class ExportTemplateRenderTestCase(TestCase):
+    """
+    Tests for ExportTemplate.render() with a queryset bound into the template context.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        Site.objects.bulk_create([
+            Site(name='Site A', slug='site-a'),
+            Site(name='Site B', slug='site-b'),
+            Site(name='Site C', slug='site-c'),
+        ])
+
+    def test_render_iterates_queryset(self):
+        t = ExportTemplate(
+            name='sites',
+            template_code='{% for obj in queryset %}{{ obj.name }}\n{% endfor %}',
+        )
+        queryset = Site.objects.order_by('name')
+        output = t.render(queryset=queryset)
+        self.assertEqual(output, 'Site A\nSite B\nSite C\n')
+
+    def test_render_to_response_for_queryset(self):
+        t = ExportTemplate(
+            name='sites',
+            template_code='{% for obj in queryset %}{{ obj.name }}\n{% endfor %}',
+            file_extension='txt',
+        )
+        response = t.render_to_response(queryset=Site.objects.order_by('name'))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], DEFAULT_MIME_TYPE)
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="netbox_sites.txt"')
+        self.assertEqual(response.content.decode(), 'Site A\nSite B\nSite C\n')
+
+
+class ExportTemplateStoredOnlyFinalizeTestCase(TestCase):
+    """
+    Tests that render() honors 'finalize' only with the value stored on the template's database record.
+    """
+    TEMPLATE_CODE = '{{ "netbox" }}'
+
+    def _create_stored(self):
+        """
+        Create a template with a stored 'finalize' value.
+        """
+        # create() does not call clean(). This matches a value stored before clean() blocked it.
+        return ExportTemplate.objects.create(
+            name='stored',
+            template_code=self.TEMPLATE_CODE,
+            environment_params={'finalize': 'builtins.len'},
+        )
+
+    @tag('regression')
+    def test_unsaved_template_ignores_finalize(self):
+        t = ExportTemplate(
+            name='unsaved',
+            template_code=self.TEMPLATE_CODE,
+            environment_params={'finalize': 'builtins.len'},
+        )
+        with self.assertLogs('extras.models.mixins', 'WARNING'):
+            self.assertEqual(t.render(), 'netbox')
+
+    def test_stored_finalize_is_applied(self):
+        self._create_stored()
+        t = ExportTemplate.objects.get(name='stored')
+        self.assertEqual(t.render(), '6')
+
+    @tag('regression')
+    def test_finalize_added_in_memory_is_ignored(self):
+        t = ExportTemplate.objects.create(name='saved', template_code=self.TEMPLATE_CODE)
+        t.environment_params = {'finalize': 'builtins.len'}
+        with self.assertLogs('extras.models.mixins', 'WARNING'):
+            self.assertEqual(t.render(), 'netbox')
+
+    @tag('regression')
+    def test_finalize_changed_in_memory_uses_stored_value(self):
+        t = self._create_stored()
+        t.environment_params = {'finalize': 'builtins.repr'}
+        with self.assertNoLogs('extras.models.mixins', 'WARNING'):
+            self.assertEqual(t.render(), '6')
+
+    @tag('regression')
+    def test_render_fails_when_template_code_differs_from_stored(self):
+        t = self._create_stored()
+        t.template_code = '{{ "changed" }}'
+        with self.assertRaises(TemplateError):
+            t.render()
+
+    @tag('regression')
+    def test_render_fails_when_stored_template_is_edited_after_load(self):
+        t = self._create_stored()
+        # An edit that saves new code must also remove 'finalize', since clean() rejects it
+        ExportTemplate.objects.filter(pk=t.pk).update(template_code='{{ "edited" }}', environment_params={})
+        with self.assertRaises(TemplateError):
+            t.render()
+
+    @tag('regression')
+    def test_render_fails_when_stored_template_is_deleted_after_load(self):
+        t = self._create_stored()
+        ExportTemplate.objects.filter(pk=t.pk).delete()
+        with self.assertRaises(TemplateError):
+            t.render()
+
+    def test_no_query_without_finalize(self):
+        t = ExportTemplate.objects.create(
+            name='plain',
+            template_code=self.TEMPLATE_CODE,
+            environment_params={'trim_blocks': True},
+        )
+        with self.assertNumQueries(0):
+            t.get_environment_params()
+
+    def test_one_query_with_stored_finalize(self):
+        t = self._create_stored()
+        with self.assertNumQueries(1):
+            t.get_environment_params()
+
+
+class WebhookPayloadUrlValidationTestCase(TestCase):
+    """Tests for Webhook.clean()'s validation of payload_url (#22828)."""
+
+    def test_payload_url_accepts_literal_url(self):
+        webhook = Webhook(name='Webhook 1', payload_url='http://example.com/hook')
+        webhook.clean()
+
+    def test_payload_url_rejects_non_url(self):
+        webhook = Webhook(name='Webhook 1', payload_url='not-a-url-at-all')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_payload_url_rejects_disallowed_scheme(self):
+        webhook = Webhook(name='Webhook 1', payload_url='file:///etc/passwd')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_payload_url_accepts_jinja2_template(self):
+        """A templated payload_url must not be rejected merely for not being a literal URL."""
+        webhook = Webhook(name='Webhook 1', payload_url='http://{{ data.name }}.example.com/hook')
+        webhook.clean()
+
+    def test_payload_url_accepts_template_using_a_registered_filter(self):
+        webhook = Webhook(name='Webhook 1', payload_url="http://example.com/{{ 'HOME' | env }}")
+        webhook.clean()
+
+    def test_payload_url_rejects_malformed_template_syntax(self):
+        webhook = Webhook(name='Webhook 1', payload_url='http://{{ data.name }.example.com/hook')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_payload_url_rejects_template_with_unregistered_filter(self):
+        webhook = Webhook(
+            name='Webhook 1', payload_url='http://example.com/{{ data.name | totally_unregistered_filter }}'
+        )
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_payload_url_accepts_single_label_host(self):
+        """A Docker/Kubernetes-style internal service name is a legitimate webhook target (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='http://webhook-receiver:8080/hook')
+        webhook.clean()
+
+    def test_payload_url_accepts_underscore_in_hostname(self):
+        """requests accepts an underscore in a hostname even though Django's URLValidator does not (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='http://my_host.example.com/hook')
+        webhook.clean()
+
+    def test_payload_url_rejects_missing_host(self):
+        webhook = Webhook(name='Webhook 1', payload_url='http:///hook')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_payload_url_rejects_templated_disallowed_scheme(self):
+        """A literal, disallowed scheme must be rejected even when the rest of the URL is templated (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='file:///{{ data.name }}')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+    def test_blank_payload_url_produces_a_single_error(self):
+        """clean() must not add its own error on top of clean_fields()'s for a blank value (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.full_clean()
+        self.assertEqual(cm.exception.message_dict['payload_url'], ['This field cannot be blank.'])
+
+    def test_none_payload_url_does_not_raise_typeerror(self):
+        webhook = Webhook(name='Webhook 1', payload_url=None)
+        webhook.clean()
+
+    def test_payload_url_accepts_fully_templated_value(self):
+        """A value with no literal scheme at all (the scheme itself is templated) must still be usable (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='{{ data.custom_fields.callback_url }}')
+        webhook.clean()
+
+    def test_payload_url_rejects_malformed_bracketed_host_gracefully(self):
+        """A malformed netloc must raise ValidationError, not an uncaught ValueError from urlsplit() (#22832)."""
+        webhook = Webhook(name='Webhook 1', payload_url='http://[2001:db8::1/hook')
+        with self.assertRaises(ValidationError) as cm:
+            webhook.clean()
+        self.assertIn('payload_url', cm.exception.message_dict)
+
+
+class EventRuleTestCase(TestCase):
+
+    def test_action_data_clean_accepts_dict(self):
+        """
+        clean() should accept a JSON object (or null) as action_data.
+        """
+        webhook = Webhook.objects.create(name='Action Data Test Webhook', payload_url='http://localhost:9000/')
+        webhook_type = ObjectType.objects.get_for_model(Webhook)
+        for value in ({'key': 'value'}, None):
+            rule = EventRule(
+                name='test',
+                event_types=[OBJECT_CREATED],
+                action_data=value,
+                action_object_type=webhook_type,
+                action_object_id=webhook.pk,
+            )
+            rule.clean()
+
+    def test_action_data_clean_rejects_non_dict(self):
+        """
+        clean() should reject action_data that is valid JSON but not an object (#21989).
+        """
+        for value in ('test', 42, [1, 2, 3], True):
+            rule = EventRule(name='test', event_types=[OBJECT_CREATED], action_data=value)
+            with self.assertRaises(ValidationError) as cm:
+                rule.clean()
+            self.assertIn('action_data', cm.exception.message_dict)
+
+
+class JinjaEnvironmentParamsCleanTestCase(TestCase):
+    """Tests for RenderTemplateMixin.clean() validation of environment_params."""
+
+    def _make_template(self, environment_params):
+        return ConfigTemplate(
+            name='test',
+            template_code='{{ "test" }}',
+            environment_params=environment_params,
+        )
+
+    def test_allowed_scalar_params_pass(self):
+        template = self._make_template({'trim_blocks': True, 'lstrip_blocks': True})
+        template.clean()
+
+    def test_autoescape_boolean_passes(self):
+        template = self._make_template({'autoescape': True})
+        template.clean()
+
+    def test_valid_undefined_passes(self):
+        for value in (
+            'jinja2.Undefined',
+            'jinja2.ChainableUndefined',
+            'jinja2.DebugUndefined',
+            'jinja2.StrictUndefined',
+        ):
+            template = self._make_template({'undefined': value})
+            template.clean()
+
+    def test_invalid_undefined_rejected(self):
+        template = self._make_template({'undefined': 'subprocess.getoutput'})
+        with self.assertRaises(ValidationError) as cm:
+            template.clean()
+        self.assertIn('environment_params', cm.exception.message_dict)
+
+    def test_unknown_key_rejected(self):
+        template = self._make_template({'extensions': ['os']})
+        with self.assertRaises(ValidationError) as cm:
+            template.clean()
+        self.assertIn('environment_params', cm.exception.message_dict)
+
+    def test_finalize_blocked_from_new_use(self):
+        template = self._make_template({'finalize': 'subprocess.getoutput'})
+        with self.assertRaises(ValidationError) as cm:
+            template.clean()
+        self.assertIn('environment_params', cm.exception.message_dict)
+
+    def test_empty_params_pass(self):
+        template = self._make_template({})
+        template.clean()
+
+    def test_none_params_pass(self):
+        template = self._make_template(None)
+        template.clean()
+
+    def test_exporttemplate_clean_rejects_unknown_key(self):
+        """MRO smoke test: ExportTemplate.clean() reaches RenderTemplateMixin.clean()."""
+        obj = ExportTemplate(
+            name='test',
+            template_code='{{ "test" }}',
+            environment_params={'loader': 'some.loader'},
+        )
+        with self.assertRaises(ValidationError) as cm:
+            obj.clean()
+        self.assertIn('environment_params', cm.exception.message_dict)
+
+    def test_configtemplate_clean_rejects_finalize(self):
+        """MRO smoke test: ConfigTemplate.clean() reaches RenderTemplateMixin.clean()."""
+        obj = ConfigTemplate(
+            name='test',
+            template_code='{{ "test" }}',
+            environment_params={'finalize': 'subprocess.getoutput'},
+        )
+        with self.assertRaises(ValidationError) as cm:
+            obj.clean()
+        self.assertIn('environment_params', cm.exception.message_dict)
+
+
+class JinjaEnvironmentParamsFilterTestCase(TestCase):
+    """Tests for RenderTemplateMixin._filter_environment_params()."""
+
+    def test_allowed_keys_pass_through(self):
+        params = {'trim_blocks': True, 'autoescape': False}
+        result = RenderTemplateMixin._filter_environment_params(params)
+        self.assertEqual(result, params)
+
+    def test_unknown_keys_stripped(self):
+        params = {'extensions': ['os'], 'loader': 'x', 'trim_blocks': True}
+        result = RenderTemplateMixin._filter_environment_params(params)
+        self.assertEqual(result, {'trim_blocks': True})
+
+    def test_finalize_preserved_as_legacy(self):
+        params = {'finalize': 'some.module.func', 'trim_blocks': True}
+        result = RenderTemplateMixin._filter_environment_params(params)
+        self.assertEqual(result, params)
+
+    def test_empty_params(self):
+        self.assertEqual(RenderTemplateMixin._filter_environment_params({}), {})
+
+
+class JinjaEnvironmentParamsResolveTestCase(TestCase):
+    """Tests for RenderTemplateMixin._resolve_mapped_params()."""
+
+    def test_undefined_resolved_to_class(self):
+        params = {'undefined': 'jinja2.StrictUndefined'}
+        result = RenderTemplateMixin._resolve_mapped_params(params)
+        self.assertIs(result['undefined'], StrictUndefined)
+
+    def test_unrecognized_undefined_value_passed_through(self):
+        params = {'undefined': 'not.a.real.class'}
+        result = RenderTemplateMixin._resolve_mapped_params(params)
+        self.assertEqual(result['undefined'], 'not.a.real.class')
+
+    def test_scalar_params_passed_through(self):
+        params = {'trim_blocks': True, 'autoescape': False}
+        result = RenderTemplateMixin._resolve_mapped_params(params)
+        self.assertEqual(result, params)
+
+    def test_empty_params(self):
+        self.assertEqual(RenderTemplateMixin._resolve_mapped_params({}), {})
+
+
+class JinjaEnvironmentParamsFinalizeTestCase(TestCase):
+    """Tests for RenderTemplateMixin._resolve_finalize() legacy carve-out."""
+
+    def test_finalize_string_resolved_via_import_string(self):
+        params = {'finalize': 'extras.tests.test_models.finalize_none_to_dash'}
+        result = RenderTemplateMixin._resolve_finalize(params)
+        self.assertIs(result['finalize'], finalize_none_to_dash)
+
+    def test_finalize_non_string_passed_through(self):
+        params = {'finalize': 42}
+        result = RenderTemplateMixin._resolve_finalize(params)
+        self.assertEqual(result['finalize'], 42)
+
+    def test_no_finalize_key_unchanged(self):
+        params = {'trim_blocks': True}
+        result = RenderTemplateMixin._resolve_finalize(params)
+        self.assertEqual(result, {'trim_blocks': True})
+
+    def test_invalid_import_path_raises_import_error(self):
+        params = {'finalize': 'nonexistent.module.func'}
+        with self.assertRaises(ImportError):
+            RenderTemplateMixin._resolve_finalize(params)
+
+    def test_empty_params(self):
+        self.assertEqual(RenderTemplateMixin._resolve_finalize({}), {})
+
+
+class JinjaEnvironmentParamsIntegrationTestCase(TestCase):
+    """Integration tests for get_environment_params() end-to-end."""
+
+    def _make_template(self, environment_params):
+        return ConfigTemplate(
+            name='test',
+            template_code='{{ "test" }}',
+            environment_params=environment_params,
+        )
+
+    def test_full_pipeline_with_undefined(self):
+        template = self._make_template({'undefined': 'jinja2.StrictUndefined', 'trim_blocks': True})
+        params = template.get_environment_params()
+        self.assertIs(params['undefined'], StrictUndefined)
+        self.assertIs(params['trim_blocks'], True)
+
+    def test_full_pipeline_strips_unknown_and_resolves(self):
+        template = self._make_template({
+            'extensions': ['os'],
+            'undefined': 'jinja2.DebugUndefined',
+            'trim_blocks': True,
+        })
+        params = template.get_environment_params()
+        self.assertNotIn('extensions', params)
+        self.assertIs(params['undefined'], DebugUndefined)
+        self.assertIs(params['trim_blocks'], True)
+
+    def test_full_pipeline_finalize_resolves(self):
+        # Only a stored 'finalize' value resolves (#23375).
+        template = self._make_template({
+            'finalize': 'extras.tests.test_models.finalize_none_to_dash',
+        })
+        template.save()
+        params = template.get_environment_params()
+        self.assertIs(params['finalize'], finalize_none_to_dash)
+
+    def test_does_not_mutate_stored_value(self):
+        template = self._make_template({'undefined': 'jinja2.StrictUndefined'})
+        template.get_environment_params()
+        self.assertEqual(template.environment_params['undefined'], 'jinja2.StrictUndefined')
+
+    def test_none_environment_params(self):
+        # ConfigTemplate always forces autoescape off (#22652).
+        template = self._make_template(None)
+        self.assertEqual(template.get_environment_params(), {'autoescape': False})
+
+    def test_empty_environment_params(self):
+        # ConfigTemplate always forces autoescape off (#22652).
+        template = self._make_template({})
+        self.assertEqual(template.get_environment_params(), {'autoescape': False})
+
+
+@override_settings(RQ_DEFAULT_TIMEOUT=300)
+class WebhookTestCase(TestCase):
+
+    def test_timeout_must_be_less_than_job_timeout(self):
+        """
+        A timeout at or above RQ_DEFAULT_TIMEOUT leaves no room for the request's own timeout to apply, and
+        is rejected.
+        """
+        webhook = Webhook(name='Webhook 1', payload_url='http://localhost:9000/')
+
+        for timeout in (300, 301):
+            webhook.timeout = timeout
+            with self.assertRaises(ValidationError):
+                webhook.full_clean()
+
+    def test_timeout_below_job_timeout_is_valid(self):
+        webhook = Webhook(name='Webhook 1', payload_url='http://localhost:9000/', timeout=299)
+        webhook.full_clean()
+
+    def test_null_timeout_is_valid(self):
+        webhook = Webhook(name='Webhook 1', payload_url='http://localhost:9000/')
+        webhook.full_clean()
+
+    @override_settings(RQ_DEFAULT_TIMEOUT='1h')
+    def test_job_timeout_duration_string_is_validated(self):
+        """
+        RQ also accepts a string timeout such as "1h", which must be normalized before comparison rather
+        than bypassing the check.
+        """
+        webhook = Webhook(name='Webhook 1', payload_url='http://localhost:9000/', timeout=3600)
+        with self.assertRaises(ValidationError):
+            webhook.full_clean()
+
+        webhook.timeout = 3599
+        webhook.full_clean()
+
+    @override_settings(RQ_DEFAULT_TIMEOUT='60')
+    def test_job_timeout_numeric_string_is_validated(self):
+        webhook = Webhook(name='Webhook 1', payload_url='http://localhost:9000/', timeout=60)
+        with self.assertRaises(ValidationError):
+            webhook.full_clean()
+
+        webhook.timeout = 59
+        webhook.full_clean()
+
+    @override_settings(RQ_DEFAULT_TIMEOUT=-1)
+    def test_unbounded_job_timeout_skips_validation(self):
+        """
+        A negative RQ timeout (-1) disables RQ's death penalty, so there is no job timeout to validate against.
+        """
+        webhook = Webhook(name='Webhook 1', payload_url='http://localhost:9000/', timeout=3600)
+        webhook.full_clean()
+
+    @override_settings(RQ_DEFAULT_TIMEOUT=0)
+    def test_zero_job_timeout_is_validated_against_queue_default(self):
+        """
+        A zero (or absent) RQ timeout is not unbounded: RQ falls back to the queue's own default, which the
+        webhook timeout must still stay below.
+        """
+        webhook = Webhook(name='Webhook 1', payload_url='http://localhost:9000/', timeout=Queue.DEFAULT_TIMEOUT)
+        with self.assertRaises(ValidationError):
+            webhook.full_clean()
+
+        webhook.timeout = Queue.DEFAULT_TIMEOUT - 1
+        webhook.full_clean()

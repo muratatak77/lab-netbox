@@ -1,0 +1,1205 @@
+import copy
+import logging
+from decimal import Decimal
+from unittest.mock import patch
+
+from django.db import connection
+from django.db.models.signals import post_init
+from django.test import override_settings, tag
+from django.test.utils import CaptureQueriesContext
+from django.urls import reverse
+from netaddr import IPNetwork
+from rest_framework import status
+
+from core.models import ObjectType
+from dcim.choices import InterfaceModeChoices
+from dcim.models import Interface, Platform, Site
+from extras.choices import CustomFieldTypeChoices
+from extras.models import ConfigContext, ConfigTemplate, CustomField, ExportTemplate
+from ipam.choices import FHRPGroupProtocolChoices, VLANQinQRoleChoices
+from ipam.models import VLAN, VRF, FHRPGroup, FHRPGroupAssignment, IPAddress, Prefix
+from users.constants import TOKEN_PREFIX
+from users.models import Token
+from utilities.testing import (
+    APITestCase,
+    APIViewTestCases,
+    create_test_device,
+    create_test_nat_ip_pair,
+    create_test_virtualmachine,
+    disable_logging,
+)
+from virtualization.choices import *
+from virtualization.models import *
+
+
+class AppTestCase(APITestCase):
+
+    def test_root(self):
+
+        url = reverse('virtualization-api:api-root')
+        response = self.client.get('{}?format=api'.format(url), **self.header)
+
+        self.assertEqual(response.status_code, 200)
+
+
+class ClusterTypeTestCase(APIViewTestCases.APIViewTestCase):
+    model = ClusterType
+    brief_fields = ['cluster_count', 'description', 'display', 'id', 'name', 'slug', 'url']
+    create_data = [
+        {
+            'name': 'Cluster Type 4',
+            'slug': 'cluster-type-4',
+        },
+        {
+            'name': 'Cluster Type 5',
+            'slug': 'cluster-type-5',
+        },
+        {
+            'name': 'Cluster Type 6',
+            'slug': 'cluster-type-6',
+        },
+    ]
+    bulk_update_data = {
+        'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'owner': 99999,
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+
+        cluster_types = (
+            ClusterType(name='Cluster Type 1', slug='cluster-type-1'),
+            ClusterType(name='Cluster Type 2', slug='cluster-type-2'),
+            ClusterType(name='Cluster Type 3', slug='cluster-type-3'),
+        )
+        ClusterType.objects.bulk_create(cluster_types)
+
+
+class ClusterGroupTestCase(APIViewTestCases.APIViewTestCase):
+    model = ClusterGroup
+    brief_fields = ['cluster_count', 'description', 'display', 'id', 'name', 'slug', 'url']
+    create_data = [
+        {
+            'name': 'Cluster Group 4',
+            'slug': 'cluster-type-4',
+        },
+        {
+            'name': 'Cluster Group 5',
+            'slug': 'cluster-type-5',
+        },
+        {
+            'name': 'Cluster Group 6',
+            'slug': 'cluster-type-6',
+        },
+    ]
+    bulk_update_data = {
+        'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'owner': 99999,
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+
+        cluster_Groups = (
+            ClusterGroup(name='Cluster Group 1', slug='cluster-type-1'),
+            ClusterGroup(name='Cluster Group 2', slug='cluster-type-2'),
+            ClusterGroup(name='Cluster Group 3', slug='cluster-type-3'),
+        )
+        ClusterGroup.objects.bulk_create(cluster_Groups)
+
+
+class ClusterTestCase(APIViewTestCases.APIViewTestCase):
+    model = Cluster
+    brief_fields = ['description', 'display', 'id', 'name', 'url', 'virtualmachine_count']
+    bulk_update_data = {
+        'status': 'offline',
+        'comments': 'New comment',
+    }
+    bulk_update_invalid_data = {
+        'status': 'not-a-valid-status',
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+
+        cluster_types = (
+            ClusterType(name='Cluster Type 1', slug='cluster-type-1'),
+            ClusterType(name='Cluster Type 2', slug='cluster-type-2'),
+        )
+        ClusterType.objects.bulk_create(cluster_types)
+
+        cluster_groups = (
+            ClusterGroup(name='Cluster Group 1', slug='cluster-group-1'),
+            ClusterGroup(name='Cluster Group 2', slug='cluster-group-2'),
+        )
+        ClusterGroup.objects.bulk_create(cluster_groups)
+
+        clusters = (
+            Cluster(
+                name='Cluster 1',
+                type=cluster_types[0],
+                group=cluster_groups[0],
+                status=ClusterStatusChoices.STATUS_PLANNED,
+            ),
+            Cluster(
+                name='Cluster 2',
+                type=cluster_types[0],
+                group=cluster_groups[0],
+                status=ClusterStatusChoices.STATUS_PLANNED,
+            ),
+            Cluster(
+                name='Cluster 3',
+                type=cluster_types[0],
+                group=cluster_groups[0],
+                status=ClusterStatusChoices.STATUS_PLANNED,
+            ),
+        )
+        for cluster in clusters:
+            cluster.save()
+
+        cls.create_data = [
+            {
+                'name': 'Cluster 4',
+                'type': cluster_types[1].pk,
+                'group': cluster_groups[1].pk,
+                'status': ClusterStatusChoices.STATUS_STAGING,
+            },
+            {
+                'name': 'Cluster 5',
+                'type': cluster_types[1].pk,
+                'group': cluster_groups[1].pk,
+                'status': ClusterStatusChoices.STATUS_STAGING,
+            },
+            {
+                'name': 'Cluster 6',
+                'type': cluster_types[1].pk,
+                'group': cluster_groups[1].pk,
+                'status': ClusterStatusChoices.STATUS_STAGING,
+            },
+        ]
+
+    def test_list_vm_totals_without_loading_virtual_machines(self):
+        """
+        VM counts and resource totals come from annotations without loading any virtual machine.
+        """
+        cluster1 = Cluster.objects.get(name='Cluster 1')
+        cluster2 = Cluster.objects.get(name='Cluster 2')
+        VirtualMachine.objects.bulk_create((
+            VirtualMachine(name='Virtual Machine 1', cluster=cluster1, vcpus=Decimal('1.5'), memory=1024, disk=10000),
+            VirtualMachine(name='Virtual Machine 2', cluster=cluster1, vcpus=Decimal('2.25'), memory=2048, disk=20000),
+            VirtualMachine(name='Virtual Machine 3', cluster=cluster1),
+            VirtualMachine(name='Virtual Machine 4', cluster=cluster2),
+        ))
+        self.add_permissions('virtualization.view_cluster')
+        loaded = []
+
+        def record(sender, instance, **kwargs):
+            loaded.append(instance)
+
+        post_init.connect(record, sender=VirtualMachine)
+        try:
+            response = self.client.get(self._get_list_url(), **self.header)
+        finally:
+            post_init.disconnect(record, sender=VirtualMachine)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        fields = ('virtualmachine_count', 'allocated_vcpus', 'allocated_memory', 'allocated_disk')
+        totals = {row['name']: tuple(row[field] for field in fields) for row in response.data['results']}
+        self.assertEqual(totals, {
+            'Cluster 1': (3, Decimal('3.75'), 3072, 30000),
+            'Cluster 2': (1, None, None, None),
+            'Cluster 3': (0, None, None, None),
+        })
+        self.assertEqual(loaded, [])
+
+
+class VirtualMachineTypeTestCase(APIViewTestCases.APIViewTestCase):
+    model = VirtualMachineType
+    brief_fields = ['description', 'display', 'id', 'name', 'slug', 'url']
+    user_permissions = ('dcim.view_platform', 'virtualization.view_virtualmachine')
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.platforms = (
+            Platform.objects.create(name='Platform 1', slug='platform-1'),
+            Platform.objects.create(name='Platform 2', slug='platform-2'),
+            Platform.objects.create(name='Platform 3', slug='platform-3'),
+        )
+
+        cls.virtual_machine_types = (
+            VirtualMachineType.objects.create(
+                name='Virtual Machine Type 1',
+                slug='virtual-machine-type-1',
+                default_platform=cls.platforms[0],
+                default_vcpus=1,
+                default_memory=1024,
+            ),
+            VirtualMachineType.objects.create(
+                name='Virtual Machine Type 2',
+                slug='virtual-machine-type-2',
+                default_platform=cls.platforms[1],
+                default_vcpus=2,
+                default_memory=2048,
+            ),
+            VirtualMachineType.objects.create(
+                name='Virtual Machine Type 3',
+                slug='virtual-machine-type-3',
+                default_platform=cls.platforms[2],
+                default_vcpus=4,
+                default_memory=4096,
+            ),
+        )
+
+        cls.create_data = [
+            {
+                'name': 'Virtual Machine Type 4',
+                'slug': 'virtual-machine-type-4',
+                'default_platform': cls.platforms[0].pk,
+                'default_vcpus': 1,
+                'default_memory': 1024,
+            },
+            {
+                'name': 'Virtual Machine Type 5',
+                'slug': 'virtual-machine-type-5',
+                'default_platform': cls.platforms[1].pk,
+                'default_vcpus': 2,
+                'default_memory': 2048,
+            },
+            {
+                'name': 'Virtual Machine Type 6',
+                'slug': 'virtual-machine-type-6',
+                'default_platform': cls.platforms[2].pk,
+                'default_vcpus': 4,
+                'default_memory': 4096,
+            },
+        ]
+
+        cls.bulk_update_data = {
+            'default_platform': cls.platforms[2].pk,
+            'default_vcpus': 8,
+            'default_memory': 8192,
+            'description': 'New description',
+        }
+        cls.bulk_update_invalid_data = {
+            'owner': 99999,
+        }
+
+
+class VirtualMachineTestCase(APIViewTestCases.APIViewTestCase):
+    model = VirtualMachine
+    brief_fields = ['description', 'display', 'id', 'name', 'url']
+    bulk_update_data = {
+        'status': 'staged',
+    }
+    bulk_update_invalid_data = {
+        'status': 'not-a-valid-status',
+    }
+    user_permissions = ('dcim.view_platform', 'virtualization.view_virtualmachinetype')
+
+    @classmethod
+    def setUpTestData(cls):
+        clustertype = ClusterType.objects.create(name='Cluster Type 1', slug='cluster-type-1')
+        clustergroup = ClusterGroup.objects.create(name='Cluster Group 1', slug='cluster-group-1')
+
+        cls.sites = (
+            Site(name='Site 1', slug='site-1'),
+            Site(name='Site 2', slug='site-2'),
+            Site(name='Site 3', slug='site-3'),
+        )
+        Site.objects.bulk_create(cls.sites)
+
+        cls.clusters = (
+            Cluster(name='Cluster 1', type=clustertype, scope=cls.sites[0], group=clustergroup),
+            Cluster(name='Cluster 2', type=clustertype, scope=cls.sites[1], group=clustergroup),
+            Cluster(name='Cluster 3', type=clustertype),
+        )
+        for cluster in cls.clusters:
+            cluster.save()
+
+        cls.devices = (
+            create_test_device('device1', site=cls.sites[0], cluster=cls.clusters[0]),
+            create_test_device('device2', site=cls.sites[1], cluster=cls.clusters[1]),
+        )
+
+        cls.platforms = (
+            Platform.objects.create(name='Platform 1', slug='platform-1'),
+            Platform.objects.create(name='Platform 2', slug='platform-2'),
+            Platform.objects.create(name='Platform 3', slug='platform-3'),
+        )
+
+        cls.vm_types = (
+            VirtualMachineType.objects.create(
+                name='Virtual Machine Type 1',
+                slug='virtual-machine-type-1',
+                default_platform=cls.platforms[0],
+                default_vcpus=2,
+                default_memory=4096,
+            ),
+            VirtualMachineType.objects.create(
+                name='Virtual Machine Type 2',
+                slug='virtual-machine-type-2',
+                default_platform=cls.platforms[1],
+                default_vcpus=4,
+                default_memory=8192,
+            ),
+        )
+
+        virtual_machines = (
+            VirtualMachine(
+                name='Virtual Machine 1',
+                virtual_machine_type=cls.vm_types[0],
+                site=cls.sites[0],
+                cluster=cls.clusters[0],
+                device=cls.devices[0],
+                platform=cls.platforms[0],
+                vcpus=2,
+                memory=4096,
+                local_context_data={'A': 1},
+            ),
+            VirtualMachine(
+                name='Virtual Machine 2',
+                site=cls.sites[0],
+                cluster=cls.clusters[0],
+                local_context_data={'B': 2},
+            ),
+            VirtualMachine(
+                name='Virtual Machine 3',
+                site=cls.sites[0],
+                cluster=cls.clusters[0],
+                local_context_data={'C': 3},
+                start_on_boot=VirtualMachineStartOnBootChoices.STATUS_ON,
+            ),
+        )
+        VirtualMachine.objects.bulk_create(virtual_machines)
+
+        cls.create_data = [
+            {
+                'name': 'Virtual Machine 4',
+                'site': cls.sites[1].pk,
+                'cluster': cls.clusters[1].pk,
+                'device': cls.devices[1].pk,
+                'virtual_machine_type': cls.vm_types[0].pk,
+            },
+            {
+                'name': 'Virtual Machine 5',
+                'site': cls.sites[1].pk,
+                'cluster': cls.clusters[1].pk,
+                'virtual_machine_type': cls.vm_types[1].pk,
+            },
+            {
+                'name': 'Virtual Machine 6',
+                'site': cls.sites[1].pk,
+            },
+            {
+                'name': 'Virtual Machine 7',
+                'cluster': cls.clusters[2].pk,
+                'virtual_machine_type': cls.vm_types[0].pk,
+                'start_on_boot': VirtualMachineStartOnBootChoices.STATUS_ON,
+            },
+        ]
+
+    def test_virtual_machine_type_defaults_applied_on_create(self):
+        data = {
+            'name': 'Virtual Machine With Defaults',
+            'site': self.sites[1].pk,
+            'cluster': self.clusters[1].pk,
+            'virtual_machine_type': self.vm_types[0].pk,
+            'platform': None,
+            'vcpus': None,
+            'memory': None,
+        }
+        self.add_permissions('virtualization.add_virtualmachine')
+
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+
+        vm = VirtualMachine.objects.get(pk=response.data['id'])
+        self.assertEqual(vm.virtual_machine_type, self.vm_types[0])
+        self.assertEqual(vm.platform, self.vm_types[0].default_platform)
+        self.assertEqual(vm.vcpus, self.vm_types[0].default_vcpus)
+        self.assertEqual(vm.memory, self.vm_types[0].default_memory)
+
+    def test_virtual_machine_type_defaults_do_not_override_explicit_values(self):
+        data = {
+            'name': 'Virtual Machine With Explicit Values',
+            'site': self.sites[1].pk,
+            'cluster': self.clusters[1].pk,
+            'virtual_machine_type': self.vm_types[0].pk,
+            'platform': self.platforms[2].pk,
+            'vcpus': 6,
+            'memory': 12288,
+        }
+        self.add_permissions('virtualization.add_virtualmachine')
+
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+
+        vm = VirtualMachine.objects.get(pk=response.data['id'])
+        self.assertEqual(vm.virtual_machine_type, self.vm_types[0])
+        self.assertEqual(vm.platform, self.platforms[2])
+        self.assertEqual(vm.vcpus, 6)
+        self.assertEqual(vm.memory, 12288)
+
+    def test_setting_virtual_machine_type_on_existing_vm_does_not_backfill_defaults(self):
+        vm = VirtualMachine.objects.get(name='Virtual Machine 2')
+        self.add_permissions('virtualization.change_virtualmachine')
+
+        response = self.client.patch(
+            self._get_detail_url(vm),
+            {'virtual_machine_type': self.vm_types[1].pk},
+            format='json',
+            **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        vm.refresh_from_db()
+        self.assertEqual(vm.virtual_machine_type, self.vm_types[1])
+        self.assertIsNone(vm.platform)
+        self.assertIsNone(vm.vcpus)
+        self.assertIsNone(vm.memory)
+
+    def test_config_context_read_without_copy(self):
+        """
+        REST and GraphQL read cached config context without copying it.
+        """
+        self.add_permissions('virtualization.view_virtualmachine')
+        VirtualMachine.objects.filter(name='Virtual Machine 1').update(_config_context_data={'A': 'cached'})
+        VirtualMachine.objects.filter(name='Virtual Machine 2').update(_config_context_data={})
+        # Virtual Machine 3 has no cache and renders its local context data
+        expected = {'Virtual Machine 1': {'A': 'cached'}, 'Virtual Machine 2': {}, 'Virtual Machine 3': {'C': 3}}
+        query = '{ virtual_machine_list { name config_context } }'
+
+        with patch('extras.models.configs.copy', wraps=copy) as copy_module:
+            rest = self.client.get(self._get_list_url(), **self.header)
+            graphql = self.client.post(reverse('graphql'), data={'query': query}, format='json', **self.header)
+        copy_module.deepcopy.assert_not_called()
+
+        self.assertHttpStatus(rest, status.HTTP_200_OK)
+        self.assertEqual({row['name']: row['config_context'] for row in rest.data['results']}, expected)
+        self.assertHttpStatus(graphql, status.HTTP_200_OK)
+        data = graphql.json()
+        self.assertNotIn('errors', data)
+        self.assertEqual(
+            {row['name']: row['config_context'] for row in data['data']['virtual_machine_list']}, expected
+        )
+
+    @tag('regression')  # Issue #23448
+    def test_config_context_graphql_selection(self):
+        """
+        GraphQL annotates config context for virtual machines with no cache however config_context is selected,
+        including through fragments, without a query per virtual machine.
+        """
+        self.add_permissions('virtualization.view_virtualmachine')
+        ConfigContext.objects.create(name='Config Context 1', weight=100, data={'foo': 123})
+        VirtualMachine.objects.update(_config_context_data=None)
+        expected = {vm.name: vm.render_config_context() for vm in VirtualMachine.objects.all()}
+
+        queries = {
+            'field': '{ virtual_machine_list { name config_context } }',
+            'inline fragment': '{ virtual_machine_list { ... on VirtualMachineType { name config_context } } }',
+            'named fragment': (
+                'fragment F on VirtualMachineType { name config_context } query { virtual_machine_list { ...F } }'
+            ),
+        }
+        for shape, query in queries.items():
+            with self.subTest(shape=shape):
+                with CaptureQueriesContext(connection) as captured:
+                    response = self.client.post(
+                        reverse('graphql'), data={'query': query}, format='json', **self.header
+                    )
+                self.assertHttpStatus(response, status.HTTP_200_OK)
+                data = response.json()
+                self.assertNotIn('errors', data)
+                rows = data['data']['virtual_machine_list']
+                self.assertEqual({row['name']: row['config_context'] for row in rows}, expected)
+                # Rendered by the annotation in a single query, not one fallback query per virtual machine
+                sql = [captured_query['sql'] for captured_query in captured.captured_queries]
+                self.assertEqual(len([s for s in sql if '"extras_configcontext"' in s]), 1)
+
+    def test_config_context_included_by_default_in_list_view(self):
+        """
+        Check that config context data is included by default in the virtual machines list.
+        """
+        virtualmachine = VirtualMachine.objects.first()
+        url = '{}?id={}'.format(reverse('virtualization-api:virtualmachine-list'), virtualmachine.pk)
+        self.add_permissions('virtualization.view_virtualmachine')
+
+        response = self.client.get(url, **self.header)
+        self.assertEqual(response.data['results'][0].get('config_context', {}).get('A'), 1)
+
+    def test_config_context_not_loaded_when_omitted(self):
+        """
+        List responses which omit config_context neither annotate it nor load the cached context.
+        """
+        self.add_permissions('virtualization.view_virtualmachine')
+        for params in ({'fields': 'id,name'}, {'omit': 'config_context'}, {'brief': 1}):
+            with self.subTest(params=params):
+                with CaptureQueriesContext(connection) as queries:
+                    response = self.client.get(self._get_list_url(), params, **self.header)
+                self.assertHttpStatus(response, status.HTTP_200_OK)
+                sql = '\n'.join(query['sql'] for query in queries.captured_queries)
+                self.assertNotIn('"config_context_data"', sql)
+                # The nested device still loads its own cache
+                self.assertNotIn('"virtualization_virtualmachine"."_config_context_data"', sql)
+
+    def test_config_context_loaded_when_requested(self):
+        """
+        Responses which include config_context read warm virtual machines from the cache and cold ones from the
+        annotation, without a query per virtual machine.
+        """
+        self.add_permissions('virtualization.view_virtualmachine')
+        ConfigContext.objects.create(name='Config Context 1', weight=100, data={'foo': 123})
+        VirtualMachine.objects.filter(name='Virtual Machine 1').update(_config_context_data={'foo': 'cached'})
+        cache_refresh = (
+            'SELECT "virtualization_virtualmachine"."id", "virtualization_virtualmachine"."_config_context_data" FROM'
+        )
+        # fields takes precedence over omit, and both over brief
+        for params in (
+            {},
+            {'fields': 'name,config_context'},
+            {'fields': 'name,config_context', 'omit': 'config_context'},
+            {'brief': 1, 'fields': 'name,config_context'},
+            {'brief': 1, 'omit': 'comments'},
+        ):
+            with self.subTest(params=params):
+                with CaptureQueriesContext(connection) as queries:
+                    response = self.client.get(self._get_list_url(), params, **self.header)
+                self.assertHttpStatus(response, status.HTTP_200_OK)
+                contexts = {row['name']: row['config_context'] for row in response.data['results']}
+                self.assertEqual(contexts, {
+                    'Virtual Machine 1': {'foo': 'cached'},
+                    'Virtual Machine 2': {'foo': 123, 'B': 2},
+                    'Virtual Machine 3': {'foo': 123, 'C': 3},
+                })
+                statements = [
+                    query['sql'] for query in queries.captured_queries if '"extras_configcontext"' in query['sql']
+                ]
+                self.assertEqual(len(statements), 1)
+                self.assertTrue(statements[0].startswith('SELECT "virtualization_virtualmachine"'))
+                refreshes = [
+                    query['sql'] for query in queries.captured_queries if query['sql'].startswith(cache_refresh)
+                ]
+                self.assertEqual(refreshes, [])
+
+    def test_unique_name_per_cluster_constraint(self):
+        """
+        Check that creating a virtual machine with a duplicate name fails.
+        """
+        data = {
+            'name': 'Virtual Machine 1',
+            'cluster': Cluster.objects.first().pk,
+        }
+        url = reverse('virtualization-api:virtualmachine-list')
+        self.add_permissions('virtualization.add_virtualmachine')
+
+        response = self.client.post(url, data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_render_config(self):
+        configtemplate = ConfigTemplate.objects.create(
+            name='Config Template 1',
+            template_code='Config for virtual machine {{ virtualmachine.name }}'
+        )
+
+        vm = VirtualMachine.objects.first()
+        vm.config_template = configtemplate
+        vm.save()
+
+        self.add_permissions(
+            'virtualization.render_config_virtualmachine', 'virtualization.view_virtualmachine'
+        )
+        url = reverse('virtualization-api:virtualmachine-render-config', kwargs={'pk': vm.pk})
+        response = self.client.post(url, {}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.data['content'], f'Config for virtual machine {vm.name}')
+
+    def test_render_config_without_permission(self):
+        configtemplate = ConfigTemplate.objects.create(
+            name='Config Template 1',
+            template_code='Config for virtual machine {{ virtualmachine.name }}'
+        )
+
+        vm = VirtualMachine.objects.first()
+        vm.config_template = configtemplate
+        vm.save()
+
+        # No permissions added - user has no render_config permission
+        url = reverse('virtualization-api:virtualmachine-render-config', kwargs={'pk': vm.pk})
+        response = self.client.post(url, {}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+
+    def test_render_config_token_write_enabled(self):
+        configtemplate = ConfigTemplate.objects.create(
+            name='Config Template 1',
+            template_code='Config for virtual machine {{ virtualmachine.name }}'
+        )
+
+        vm = VirtualMachine.objects.first()
+        vm.config_template = configtemplate
+        vm.save()
+
+        self.add_permissions('virtualization.render_config_virtualmachine', 'virtualization.view_virtualmachine')
+        url = reverse('virtualization-api:virtualmachine-render-config', kwargs={'pk': vm.pk})
+
+        # Request without token auth should fail with PermissionDenied
+        response = self.client.post(url, {}, format='json')
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+
+        # Create token with write_enabled=False
+        token = Token.objects.create(version=2, user=self.user, write_enabled=False)
+        token_header = f'Bearer {TOKEN_PREFIX}{token.key}.{token.token}'
+
+        # Request with write-disabled token should fail
+        response = self.client.post(url, {}, format='json', HTTP_AUTHORIZATION=token_header)
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+
+        # Enable write and retry
+        token.write_enabled = True
+        token.save()
+        response = self.client.post(url, {}, format='json', HTTP_AUTHORIZATION=token_header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+    def test_list_object_includes_nat_inside_on_primary_ip(self):
+        virtualmachine = create_test_virtualmachine('natted-vm')
+        interface = VMInterface.objects.create(virtual_machine=virtualmachine, name='eth0')
+
+        real_ip, nat_ip = create_test_nat_ip_pair(
+            real_address='10.0.1.10/32',
+            nat_address='198.51.100.20/32',
+            inside_interface=interface,
+        )
+
+        virtualmachine.primary_ip4 = nat_ip
+        virtualmachine.save()
+
+        self.add_permissions('virtualization.view_virtualmachine', 'ipam.view_ipaddress')
+        response = self.client.get(f'{self._get_list_url()}?id={virtualmachine.pk}', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        result = response.data['results'][0]
+        for field in ('primary_ip', 'primary_ip4'):
+            self.assertEqual(result[field]['address'], str(nat_ip.address))
+            self.assertEqual(result[field]['nat_inside']['address'], str(real_ip.address))
+            self.assertEqual(result[field]['nat_outside'], [])
+
+    def test_get_object_includes_nat_outside_on_primary_ip(self):
+        virtualmachine = create_test_virtualmachine('real-ip-vm')
+        interface = VMInterface.objects.create(virtual_machine=virtualmachine, name='eth0')
+
+        real_ip, nat_ip = create_test_nat_ip_pair(
+            real_address='10.0.1.11/32',
+            nat_address='198.51.100.21/32',
+            inside_interface=interface,
+        )
+
+        virtualmachine.primary_ip4 = real_ip
+        virtualmachine.save()
+
+        self.add_permissions('virtualization.view_virtualmachine', 'ipam.view_ipaddress')
+        response = self.client.get(
+            self._get_detail_url(virtualmachine),
+            **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        for field in ('primary_ip', 'primary_ip4'):
+            self.assertEqual(response.data[field]['address'], str(real_ip.address))
+            self.assertIsNone(response.data[field]['nat_inside'])
+            self.assertCountEqual(
+                [ip['address'] for ip in response.data[field]['nat_outside']],
+                [str(nat_ip.address)],
+            )
+
+    def test_get_object_includes_dns_name_on_primary_ip(self):
+        virtualmachine = create_test_virtualmachine('dns-vm')
+        interfaces = (
+            VMInterface.objects.create(virtual_machine=virtualmachine, name='eth0'),
+            VMInterface.objects.create(virtual_machine=virtualmachine, name='eth1'),
+        )
+
+        ip4 = IPAddress(address='192.0.2.40/32', dns_name='vm4.example.com')
+        ip4.assigned_object = interfaces[0]
+        ip4.save()
+        ip6 = IPAddress(address='2001:db8::40/128', dns_name='vm6.example.com')
+        ip6.assigned_object = interfaces[1]
+        ip6.save()
+
+        virtualmachine.primary_ip4 = ip4
+        virtualmachine.primary_ip6 = ip6
+        virtualmachine.save()
+
+        self.add_permissions('virtualization.view_virtualmachine', 'ipam.view_ipaddress')
+        response = self.client.get(
+            f'{self._get_detail_url(virtualmachine)}?exclude=config_context',
+            **self.header,
+        )
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        self.assertEqual(response.data['primary_ip4']['dns_name'], 'vm4.example.com')
+        self.assertEqual(response.data['primary_ip6']['dns_name'], 'vm6.example.com')
+        self.assertIn(
+            response.data['primary_ip']['dns_name'],
+            ('vm4.example.com', 'vm6.example.com'),
+        )
+
+    @tag('regression')  # Ref: #23278
+    def test_create_with_unassigned_primary_ip(self):
+        """Creating a VM with an unassigned primary IP returns HTTP 400."""
+        ip4 = IPAddress.objects.create(address='192.0.2.10/24')
+        ip6 = IPAddress.objects.create(address='2001:db8::10/64')
+
+        self.add_permissions('virtualization.add_virtualmachine')
+        for field, ip in (('primary_ip4', ip4), ('primary_ip6', ip6)):
+            with self.subTest(field=field):
+                data = {
+                    'name': 'vm-new',
+                    'site': self.sites[0].pk,
+                    field: ip.pk,
+                }
+                response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+                self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+                self.assertIn(field, response.data)
+
+    def test_render_config_with_config_template_id(self):
+        default_template = ConfigTemplate.objects.create(
+            name='Default Template',
+            template_code='Default config for {{ virtualmachine.name }}'
+        )
+        override_template = ConfigTemplate.objects.create(
+            name='Override Template',
+            template_code='Override config for {{ virtualmachine.name }}'
+        )
+
+        vm = VirtualMachine.objects.first()
+        vm.config_template = default_template
+        vm.save()
+
+        self.add_permissions(
+            'virtualization.render_config_virtualmachine', 'virtualization.view_virtualmachine',
+            'extras.view_configtemplate'
+        )
+        url = reverse('virtualization-api:virtualmachine-render-config', kwargs={'pk': vm.pk})
+
+        # Render with override template
+        response = self.client.post(url, {'config_template_id': override_template.pk}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.data['content'], f'Override config for {vm.name}')
+
+        # Render with nonexistent config_template_id
+        response = self.client.post(url, {'config_template_id': 999999}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+        # Render with non-integer config_template_id
+        response = self.client.post(url, {'config_template_id': 'abc'}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+        # Without view_configtemplate permission, override template should not be accessible
+        self.remove_permissions('extras.view_configtemplate')
+        response = self.client.post(url, {'config_template_id': override_template.pk}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+
+class VMInterfaceTestCase(APIViewTestCases.APIViewTestCase):
+    model = VMInterface
+    brief_fields = ['description', 'display', 'id', 'name', 'url', 'virtual_machine']
+    bulk_update_data = {
+        'description': 'New description',
+    }
+    bulk_update_invalid_data = {
+        'mode': 'not-a-valid-mode',
+    }
+    graphql_base_name = 'vm_interface'
+    user_permissions = ('virtualization.view_virtualmachine', )
+
+    @classmethod
+    def setUpTestData(cls):
+        virtualmachine = create_test_virtualmachine('Virtual Machine 1')
+
+        interfaces = (
+            VMInterface(virtual_machine=virtualmachine, name='Interface 1'),
+            VMInterface(virtual_machine=virtualmachine, name='Interface 2'),
+            VMInterface(virtual_machine=virtualmachine, name='Interface 3'),
+        )
+        VMInterface.objects.bulk_create(interfaces)
+
+        vlans = (
+            VLAN(name='VLAN 1', vid=1),
+            VLAN(name='VLAN 2', vid=2),
+            VLAN(name='VLAN 3', vid=3),
+            VLAN(name='SVLAN 1', vid=1001, qinq_role=VLANQinQRoleChoices.ROLE_SERVICE),
+        )
+        VLAN.objects.bulk_create(vlans)
+
+        vrfs = (
+            VRF(name='VRF 1'),
+            VRF(name='VRF 2'),
+            VRF(name='VRF 3'),
+        )
+        VRF.objects.bulk_create(vrfs)
+
+        cls.create_data = [
+            {
+                'virtual_machine': virtualmachine.pk,
+                'name': 'Interface 4',
+                'mode': InterfaceModeChoices.MODE_TAGGED,
+                'tagged_vlans': [vlans[0].pk, vlans[1].pk],
+                'untagged_vlan': vlans[2].pk,
+                'vrf': vrfs[0].pk,
+            },
+            {
+                'virtual_machine': virtualmachine.pk,
+                'name': 'Interface 5',
+                'mode': InterfaceModeChoices.MODE_TAGGED,
+                'bridge': interfaces[0].pk,
+                'tagged_vlans': [vlans[0].pk, vlans[1].pk],
+                'untagged_vlan': vlans[2].pk,
+                'vrf': vrfs[1].pk,
+            },
+            {
+                'virtual_machine': virtualmachine.pk,
+                'name': 'Interface 6',
+                'mode': InterfaceModeChoices.MODE_TAGGED,
+                'parent': interfaces[1].pk,
+                'tagged_vlans': [vlans[0].pk, vlans[1].pk],
+                'untagged_vlan': vlans[2].pk,
+                'vrf': vrfs[2].pk,
+            },
+            {
+                'virtual_machine': virtualmachine.pk,
+                'name': 'Interface 7',
+                'mode': InterfaceModeChoices.MODE_Q_IN_Q,
+                'qinq_svlan': vlans[3].pk,
+            },
+        ]
+
+    @tag('regression')
+    def test_set_vminterface_as_object_in_custom_field(self):
+        cf = CustomField.objects.create(
+            name='associated_interface',
+            type=CustomFieldTypeChoices.TYPE_OBJECT,
+            related_object_type=ObjectType.objects.get_for_model(VMInterface),
+            required=False
+        )
+        cf.object_types.set([ObjectType.objects.get_for_model(Prefix)])
+        cf.save()
+
+        prefix = Prefix.objects.create(prefix=IPNetwork('10.0.0.0/12'))
+        vmi = VMInterface.objects.first()
+
+        url = reverse('ipam-api:prefix-detail', kwargs={'pk': prefix.pk})
+        data = {
+            'custom_fields': {
+                'associated_interface': vmi.id,
+            },
+        }
+
+        self.add_permissions('ipam.change_prefix')
+
+        response = self.client.patch(url, data, format='json', **self.header)
+        self.assertEqual(response.status_code, 200)
+
+        prefix_data = response.json()
+        self.assertEqual(prefix_data['custom_fields']['associated_interface']['id'], vmi.id)
+
+        reloaded_prefix = Prefix.objects.get(pk=prefix.pk)
+        self.assertEqual(prefix.pk, reloaded_prefix.pk)
+        self.assertNotEqual(reloaded_prefix.cf['associated_interface'], None)
+
+    def test_bulk_delete_child_interfaces(self):
+        interface1 = VMInterface.objects.get(name='Interface 1')
+        virtual_machine = interface1.virtual_machine
+        self.add_permissions('virtualization.delete_vminterface')
+
+        # Create a child interface
+        child = VMInterface.objects.create(
+            virtual_machine=virtual_machine,
+            name='Interface 1A',
+            parent=interface1
+        )
+        self.assertEqual(virtual_machine.interfaces.count(), 4)
+
+        # Attempt to delete only the parent interface
+        url = self._get_detail_url(interface1)
+        with disable_logging(level=logging.WARNING):
+            self.client.delete(url, **self.header)
+        self.assertEqual(virtual_machine.interfaces.count(), 4)  # Parent was not deleted
+
+        # Attempt to bulk delete parent & child together
+        data = [
+            {"id": interface1.pk},
+            {"id": child.pk},
+        ]
+        self.client.delete(self._get_list_url(), data, format='json', **self.header)
+        self.assertEqual(virtual_machine.interfaces.count(), 2)  # Child & parent were both deleted
+
+    def test_mac_address_create(self):
+        """
+        Creating a VMInterface with mac_address creates the primary MACAddress in one request.
+        """
+        self.add_permissions('virtualization.add_vminterface', 'dcim.add_macaddress')
+        vm = VMInterface.objects.first().virtual_machine
+        data = {
+            'virtual_machine': vm.pk,
+            'name': 'Interface MAC Create',
+            'mac_address': 'AA:BB:CC:DD:EE:FF',
+        }
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        iface = VMInterface.objects.get(pk=response.data['id'])
+        self.assertIsNotNone(iface.primary_mac_address)
+        self.assertEqual(str(iface.primary_mac_address.mac_address).upper(), 'AA:BB:CC:DD:EE:FF')
+        self.assertEqual(iface.primary_mac_address.assigned_object, iface)
+
+    def test_mac_address_update(self):
+        """
+        Patching mac_address creates/updates the primary MACAddress in one request.
+        """
+        self.add_permissions('virtualization.change_vminterface', 'dcim.add_macaddress', 'dcim.change_macaddress')
+        iface = VMInterface.objects.first()
+        url = self._get_detail_url(iface)
+
+        # Set a new primary MAC via mac_address shortcut
+        response = self.client.patch(url, {'mac_address': '11:22:33:44:55:66'}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        iface.refresh_from_db()
+        self.assertIsNotNone(iface.primary_mac_address)
+        self.assertEqual(str(iface.primary_mac_address.mac_address).upper(), '11:22:33:44:55:66')
+
+        # Update the MAC to a new value
+        response = self.client.patch(url, {'mac_address': 'AA:BB:CC:DD:EE:FF'}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        iface.refresh_from_db()
+        self.assertEqual(str(iface.primary_mac_address.mac_address).upper(), 'AA:BB:CC:DD:EE:FF')
+
+        # Clear the primary MAC by sending null
+        response = self.client.patch(url, {'mac_address': None}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        iface.refresh_from_db()
+        self.assertIsNone(iface.primary_mac_address)
+
+    def test_mac_address_invalid(self):
+        """
+        Sending an invalid MAC address string returns a 400 error.
+        """
+        self.add_permissions('virtualization.add_vminterface', 'dcim.add_macaddress')
+        vm = VMInterface.objects.first().virtual_machine
+        data = {
+            'virtual_machine': vm.pk,
+            'name': 'Interface MAC Bad',
+            'mac_address': 'not-a-mac',
+        }
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('mac_address', response.data)
+
+    def test_mac_address_find_or_create(self):
+        """
+        Patching mac_address with a MAC that already exists on the VMInterface promotes it to
+        primary without creating a duplicate MACAddress record.
+        """
+        from dcim.models import MACAddress
+        self.add_permissions('virtualization.change_vminterface', 'dcim.add_macaddress', 'dcim.change_macaddress')
+        iface = VMInterface.objects.first()
+
+        mac1 = MACAddress.objects.create(mac_address='CC:DD:EE:FF:00:01', assigned_object=iface)
+        mac2 = MACAddress.objects.create(mac_address='CC:DD:EE:FF:00:02', assigned_object=iface)
+        iface.primary_mac_address = mac1
+        iface.save()
+
+        mac_count_before = iface.mac_addresses.count()
+        url = self._get_detail_url(iface)
+
+        response = self.client.patch(url, {'mac_address': 'CC:DD:EE:FF:00:02'}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+
+        iface.refresh_from_db()
+        self.assertEqual(iface.primary_mac_address.pk, mac2.pk)
+        self.assertEqual(iface.mac_addresses.count(), mac_count_before)
+
+    def test_mac_address_conflicts_with_primary_mac_address(self):
+        """
+        Supplying both mac_address and primary_mac_address in one request is rejected on VMInterface
+        too (the shared shortcut mixin applies to both interface types).
+        """
+        from dcim.models import MACAddress
+
+        self.add_permissions(
+            'virtualization.change_vminterface', 'dcim.add_macaddress', 'dcim.change_macaddress'
+        )
+        iface = VMInterface.objects.first()
+        mac = MACAddress.objects.create(mac_address='DD:EE:FF:00:11:22', assigned_object=iface)
+        url = self._get_detail_url(iface)
+
+        response = self.client.patch(
+            url,
+            {'mac_address': 'DD:EE:FF:00:11:33', 'primary_mac_address': {'mac_address': str(mac.mac_address)}},
+            format='json',
+            **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_mac_address_conflicts_with_explicit_null_primary(self):
+        """
+        The presence-based conflict guard applies to VMInterface too: mac_address shortcut plus an
+        explicit primary_mac_address=null is rejected.
+        """
+        self.add_permissions('virtualization.change_vminterface', 'dcim.add_macaddress')
+        iface = VMInterface.objects.first()
+        url = self._get_detail_url(iface)
+
+        response = self.client.patch(
+            url,
+            {'mac_address': 'DD:EE:FF:00:11:44', 'primary_mac_address': None},
+            format='json',
+            **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_primary_mac_address_must_belong_to_interface(self):
+        """
+        Setting primary_mac_address to a MAC not assigned to this VMInterface is rejected on update,
+        so the primary MAC can't dangle outside the interface's own MAC set.
+        """
+        from dcim.models import MACAddress
+
+        self.add_permissions('virtualization.change_vminterface', 'dcim.change_macaddress')
+        iface = VMInterface.objects.first()
+        unassigned = MACAddress.objects.create(mac_address='DD:EE:FF:00:11:55')
+        url = self._get_detail_url(iface)
+
+        response = self.client.patch(
+            url,
+            {'primary_mac_address': {'mac_address': str(unassigned.mac_address)}},
+            format='json',
+            **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        iface.refresh_from_db()
+        self.assertIsNone(iface.primary_mac_address)
+
+    @override_settings(CUSTOM_VALIDATORS={'dcim.macaddress': [{'mac_address': {'regex': '^AA:'}}]})
+    def test_mac_address_custom_validation_returns_400(self):
+        """
+        A MAC that fails a custom validator on VMInterface creation returns 400, not 500.
+        """
+        self.add_permissions('virtualization.add_vminterface', 'dcim.add_macaddress')
+        vm = VirtualMachine.objects.first()
+        data = {
+            'virtual_machine': vm.pk,
+            'name': 'VMInterface Custom Validation',
+            'mac_address': 'BB:CC:DD:EE:FF:00',
+        }
+        response = self.client.post(self._get_list_url(), data, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+
+    def test_count_ipaddresses_and_fhrp_groups(self):
+        """Counts come from annotations of the VM interface's object type, never from loaded related objects."""
+        self.add_permissions('virtualization.view_vminterface')
+        vm_interface = VMInterface.objects.get(name='Interface 1')
+        group = FHRPGroup.objects.create(
+            pk=vm_interface.pk, protocol=FHRPGroupProtocolChoices.PROTOCOL_VRRP2, group_id=1
+        )
+        other_group = FHRPGroup.objects.create(
+            pk=vm_interface.pk + 1, protocol=FHRPGroupProtocolChoices.PROTOCOL_VRRP2, group_id=2
+        )
+        interface = Interface.objects.create(
+            pk=vm_interface.pk, device=create_test_device('Device 1'), name='eth0', type='1000base-t'
+        )
+        IPAddress.objects.bulk_create((
+            IPAddress(address='192.0.2.1/24', assigned_object=vm_interface),
+            IPAddress(address='2001:db8::1/64', assigned_object=vm_interface),
+            IPAddress(address='192.0.2.2/24', assigned_object=interface),
+            IPAddress(address='192.0.2.254/24', assigned_object=group),
+        ))
+        FHRPGroupAssignment.objects.bulk_create((
+            FHRPGroupAssignment(group=group, interface=vm_interface, priority=100),
+            # Two on the dcim interface, so a count of the wrong object type cannot match
+            FHRPGroupAssignment(group=group, interface=interface, priority=100),
+            FHRPGroupAssignment(group=other_group, interface=interface, priority=100),
+        ))
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(self._get_list_url(), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        counts = {
+            row['name']: (row['count_ipaddresses'], row['count_fhrp_groups']) for row in response.data['results']
+        }
+        self.assertEqual(counts, {'Interface 1': (2, 1), 'Interface 2': (0, 0), 'Interface 3': (0, 0)})
+        # Only the VM interface statement reads the related tables, through its two count subqueries
+        statements = [
+            query['sql'] for query in queries.captured_queries
+            if '"ipam_ipaddress"' in query['sql'] or '"ipam_fhrpgroupassignment"' in query['sql']
+        ]
+        self.assertEqual(len(statements), 1)
+        self.assertTrue(statements[0].startswith('SELECT "virtualization_vminterface"'))
+        # Unannotated instances count through the relations
+        self.assertEqual((vm_interface.count_ipaddresses, vm_interface.count_fhrp_groups), (2, 1))
+
+    def test_export_template_prefetches_related_objects(self):
+        """An API export renders model instances, so it prefetches each counted relation once."""
+        self.add_permissions('virtualization.view_vminterface', 'extras.view_exporttemplate')
+        vm_interface = VMInterface.objects.get(name='Interface 1')
+        IPAddress.objects.create(address='192.0.2.1/24', assigned_object=vm_interface)
+        group = FHRPGroup.objects.create(protocol=FHRPGroupProtocolChoices.PROTOCOL_VRRP2, group_id=1)
+        FHRPGroupAssignment.objects.create(group=group, interface=vm_interface, priority=100)
+        export_template = ExportTemplate.objects.create(
+            name='VM Interface Relations',
+            template_code=(
+                '{% for interface in queryset %}{{ interface.name }}={{ interface.ip_addresses.all()|length }}/'
+                '{{ interface.fhrp_group_assignments.all()|length }},{% endfor %}'
+            ),
+        )
+        export_template.object_types.set([ObjectType.objects.get_for_model(VMInterface)])
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(self._get_list_url(), {'export': export_template.name}, **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.content.decode(), 'Interface 1=1/1,Interface 2=0/0,Interface 3=0/0,')
+        for table in ('ipam_ipaddress', 'ipam_fhrpgroupassignment'):
+            statements = [query['sql'] for query in queries.captured_queries if f'FROM "{table}"' in query['sql']]
+            self.assertEqual(len(statements), 1, table)
+
+
+class VirtualDiskTestCase(APIViewTestCases.APIViewTestCase):
+    model = VirtualDisk
+    brief_fields = ['description', 'display', 'id', 'name', 'size', 'url', 'virtual_machine']
+    bulk_update_data = {
+        'size': 888,
+    }
+    bulk_update_invalid_data = {
+        'virtual_machine': 99999,
+    }
+    graphql_base_name = 'virtual_disk'
+    user_permissions = ('virtualization.view_virtualmachine', )
+
+    @classmethod
+    def setUpTestData(cls):
+        virtualmachine = create_test_virtualmachine('Virtual Machine 1')
+
+        disks = (
+            VirtualDisk(virtual_machine=virtualmachine, name='Disk 1', size=10),
+            VirtualDisk(virtual_machine=virtualmachine, name='Disk 2', size=20),
+            VirtualDisk(virtual_machine=virtualmachine, name='Disk 3', size=30),
+        )
+        VirtualDisk.objects.bulk_create(disks)
+
+        cls.create_data = [
+            {
+                'virtual_machine': virtualmachine.pk,
+                'name': 'Disk 4',
+                'size': 10,
+            },
+            {
+                'virtual_machine': virtualmachine.pk,
+                'name': 'Disk 5',
+                'size': 20,
+            },
+            {
+                'virtual_machine': virtualmachine.pk,
+                'name': 'Disk 6',
+                'size': 30,
+            },
+        ]

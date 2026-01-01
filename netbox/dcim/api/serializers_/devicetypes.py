@@ -1,0 +1,157 @@
+import decimal
+
+from django.utils.translation import gettext as _
+from rest_framework import serializers
+
+from dcim.choices import *
+from dcim.models import DeviceType, ModuleBayType, ModuleType, ModuleTypeProfile
+from netbox.api.fields import AttributesField, ChoiceField, SerializedPKRelatedField
+from netbox.api.serializers import PrimaryModelSerializer
+from netbox.choices import *
+
+from .manufacturers import ManufacturerSerializer
+from .platforms import PlatformSerializer
+
+__all__ = (
+    'DeviceTypeSerializer',
+    'ModuleBayTypeSerializer',
+    'ModuleTypeProfileSerializer',
+    'ModuleTypeSerializer',
+)
+
+
+class DeviceTypeSerializer(PrimaryModelSerializer):
+    manufacturer = ManufacturerSerializer(nested=True)
+    default_platform = PlatformSerializer(nested=True, required=False, allow_null=True)
+    u_height = serializers.DecimalField(
+        max_digits=4,
+        decimal_places=1,
+        label=_('Position (U)'),
+        min_value=decimal.Decimal(0),
+        default=1.0
+    )
+    subdevice_role = ChoiceField(choices=SubdeviceRoleChoices, allow_blank=True, required=False, allow_null=True)
+    airflow = ChoiceField(choices=DeviceAirflowChoices, allow_blank=True, required=False, allow_null=True)
+    cooling_method = ChoiceField(choices=CoolingMethodChoices, allow_blank=True, required=False, allow_null=True)
+    weight_unit = ChoiceField(choices=WeightUnitChoices, allow_blank=True, required=False, allow_null=True)
+    front_image = serializers.ImageField(required=False, allow_null=True)
+    rear_image = serializers.ImageField(required=False, allow_null=True)
+
+    # Counter fields
+    console_port_template_count = serializers.IntegerField(read_only=True)
+    console_server_port_template_count = serializers.IntegerField(read_only=True)
+    power_port_template_count = serializers.IntegerField(read_only=True)
+    power_outlet_template_count = serializers.IntegerField(read_only=True)
+    cooling_intake_template_count = serializers.IntegerField(read_only=True)
+    cooling_outflow_template_count = serializers.IntegerField(read_only=True)
+    interface_template_count = serializers.IntegerField(read_only=True)
+    front_port_template_count = serializers.IntegerField(read_only=True)
+    rear_port_template_count = serializers.IntegerField(read_only=True)
+    device_bay_template_count = serializers.IntegerField(read_only=True)
+    module_bay_template_count = serializers.IntegerField(read_only=True)
+    inventory_item_template_count = serializers.IntegerField(read_only=True)
+    device_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = DeviceType
+        fields = [
+            'id', 'url', 'display_url', 'display', 'manufacturer', 'default_platform', 'model', 'slug', 'part_number',
+            'u_height', 'exclude_from_utilization', 'is_full_depth', 'subdevice_role', 'airflow', 'cooling_method',
+            'weight', 'weight_unit', 'end_of_life', 'front_image', 'rear_image', 'description', 'owner',
+            'comments', 'tags', 'custom_fields',
+            'created', 'last_updated', 'device_count', 'console_port_template_count',
+            'console_server_port_template_count', 'power_port_template_count', 'power_outlet_template_count',
+            'cooling_intake_template_count', 'cooling_outflow_template_count', 'interface_template_count',
+            'front_port_template_count', 'rear_port_template_count', 'device_bay_template_count',
+            'module_bay_template_count', 'inventory_item_template_count',
+        ]
+        brief_fields = ('id', 'url', 'display', 'manufacturer', 'model', 'slug', 'description', 'device_count')
+
+
+class ModuleBayTypeSerializer(PrimaryModelSerializer):
+    manufacturer = ManufacturerSerializer(
+        nested=True,
+        required=False,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = ModuleBayType
+        fields = [
+            'id', 'url', 'display_url', 'display', 'name', 'slug', 'manufacturer', 'color', 'description', 'owner',
+            'comments', 'tags', 'custom_fields', 'created', 'last_updated',
+        ]
+        brief_fields = ('id', 'url', 'display', 'name', 'slug', 'manufacturer', 'color', 'description')
+
+
+class ModuleTypeProfileSerializer(PrimaryModelSerializer):
+
+    class Meta:
+        model = ModuleTypeProfile
+        fields = [
+            'id', 'url', 'display_url', 'display', 'name', 'description', 'schema', 'owner', 'comments', 'tags',
+            'custom_fields', 'created', 'last_updated',
+        ]
+        brief_fields = ('id', 'url', 'display', 'name', 'description')
+
+
+class ModuleTypeSerializer(PrimaryModelSerializer):
+    profile = ModuleTypeProfileSerializer(
+        nested=True,
+        required=False,
+        allow_null=True
+    )
+    manufacturer = ManufacturerSerializer(
+        nested=True
+    )
+    module_bay_types = SerializedPKRelatedField(
+        queryset=ModuleBayType.objects.all(),
+        serializer=ModuleBayTypeSerializer,
+        nested=True,
+        required=False,
+        many=True
+    )
+    weight_unit = ChoiceField(
+        choices=WeightUnitChoices,
+        allow_blank=True,
+        required=False,
+        allow_null=True
+    )
+    airflow = ChoiceField(
+        choices=ModuleAirflowChoices,
+        allow_blank=True,
+        required=False,
+        allow_null=True
+    )
+    cooling_method = ChoiceField(choices=CoolingMethodChoices, allow_blank=True, required=False, allow_null=True)
+    attributes = AttributesField(
+        source='attribute_data',
+        required=False,
+        allow_null=True
+    )
+    module_count = serializers.IntegerField(read_only=True)
+
+    # Counter fields
+    console_port_template_count = serializers.IntegerField(read_only=True)
+    console_server_port_template_count = serializers.IntegerField(read_only=True)
+    power_port_template_count = serializers.IntegerField(read_only=True)
+    power_outlet_template_count = serializers.IntegerField(read_only=True)
+    cooling_intake_template_count = serializers.IntegerField(read_only=True)
+    cooling_outflow_template_count = serializers.IntegerField(read_only=True)
+    interface_template_count = serializers.IntegerField(read_only=True)
+    front_port_template_count = serializers.IntegerField(read_only=True)
+    rear_port_template_count = serializers.IntegerField(read_only=True)
+    module_bay_template_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = ModuleType
+        fields = [
+            'id', 'url', 'display_url', 'display', 'profile', 'manufacturer', 'model', 'part_number', 'airflow',
+            'cooling_method', 'weight', 'weight_unit', 'end_of_life', 'description', 'attributes', 'module_bay_types',
+            'owner', 'comments', 'tags', 'custom_fields',
+            'created', 'last_updated', 'module_count', 'console_port_template_count',
+            'console_server_port_template_count', 'power_port_template_count', 'power_outlet_template_count',
+            'cooling_intake_template_count', 'cooling_outflow_template_count', 'interface_template_count',
+            'front_port_template_count', 'rear_port_template_count', 'module_bay_template_count',
+        ]
+        brief_fields = ('id', 'url', 'display', 'profile', 'manufacturer', 'model', 'description', 'module_count')

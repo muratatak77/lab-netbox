@@ -1,0 +1,264 @@
+import logging
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+from django import template
+from django.templatetags.static import static
+from django.utils.safestring import mark_safe
+
+from extras.choices import CustomFieldTypeChoices
+from utilities.querydict import dict_to_querydict
+from utilities.validators import url_scheme_is_allowed
+
+__all__ = (
+    'badge',
+    'checkmark',
+    'copy_content',
+    'customfield_value',
+    'formaction',
+    'htmx_table',
+    'static_with_params',
+    'tag',
+)
+
+register = template.Library()
+
+# Query parameters which indicate that a URL has been cryptographically signed by the storage
+# backend. Parameters must not be appended to such URLs, as doing so invalidates the signature.
+SIGNED_URL_PARAMS = (
+    'signature',         # AWS signature v2; Google Cloud Storage v2
+    'x-amz-signature',   # AWS signature v4 (also MinIO, Ceph, Garage, Cloudflare R2, et al.)
+    'x-goog-signature',  # Google Cloud Storage v4
+)
+
+
+@register.inclusion_tag('builtins/tag.html')
+def tag(value, viewname=None):
+    """
+    Display a tag, optionally linked to a filtered list of objects.
+
+    Args:
+        value: A Tag instance
+        viewname: If provided, the tag will be a hyperlink to the specified view's URL
+    """
+    return {
+        'tag': value,
+        'viewname': viewname,
+    }
+
+
+@register.inclusion_tag('builtins/customfield_value.html')
+def customfield_value(customfield, value):
+    """
+    Render a custom field value according to the field type.
+
+    Args:
+        customfield: A CustomField instance
+        value: The custom field value applied to an object
+    """
+    color = None
+    value_has_colors = False
+    # Determines whether a URL value may be rendered as a clickable link
+    url_allowed = False
+
+    if value:
+        if customfield.type == CustomFieldTypeChoices.TYPE_SELECT:
+            color = customfield.get_choice_color(value)
+            value = customfield.get_choice_label(value)
+        elif customfield.type == CustomFieldTypeChoices.TYPE_MULTISELECT:
+            value = [(customfield.get_choice_label(v), customfield.get_choice_color(v)) for v in value]
+            value_has_colors = any(choice_color for _, choice_color in value)
+            if not value_has_colors:
+                value = [choice_label for choice_label, _ in value]
+        elif customfield.type == CustomFieldTypeChoices.TYPE_URL:
+            # Only render as a link if the scheme is permitted by ALLOWED_URL_SCHEMES. This guards against
+            # dangerous schemes (e.g. javascript:) in values stored before validation was enforced or via
+            # paths which bypass model validation. A schemeless (relative) value is considered safe.
+            url_allowed = url_scheme_is_allowed(value)
+    return {
+        'customfield': customfield,
+        'value': value,
+        'color': color,
+        'value_has_colors': value_has_colors,
+        'url_allowed': url_allowed,
+    }
+
+
+@register.inclusion_tag('builtins/badge.html')
+def badge(value, bg_color=None, hex_color=None, url=None, show_empty=False):
+    """
+    Display the specified value as a badge.
+
+    Args:
+        value: The value to be displayed within the badge
+        bg_color: Background color CSS name
+        hex_color: Background color in hexadecimal RRGGBB format
+        url: If provided, wrap the badge in a hyperlink
+        show_empty: If true, display the badge even if value is None or zero
+    """
+    return {
+        'value': value,
+        'bg_color': bg_color or 'secondary',
+        'hex_color': hex_color.lstrip('#') if hex_color else None,
+        'url': url,
+        'show_empty': show_empty,
+    }
+
+
+@register.inclusion_tag('builtins/checkmark.html')
+def checkmark(value, show_false=True, true='Yes', false='No'):
+    """
+    Display either a green checkmark or red X to indicate a boolean value.
+
+    Args:
+        value: True or False
+        show_false: Show false values
+        true: Text label for true values
+        false: Text label for false values
+    """
+    return {
+        'value': bool(value),
+        'show_false': show_false,
+        'true_label': true,
+        'false_label': false,
+    }
+
+
+@register.inclusion_tag('builtins/copy_content.html')
+def copy_content(target, prefix=None, color='primary', classes=None):
+    """
+    Display a copy button to copy the content of a field.
+    """
+    return {
+        'target': f'#{prefix or ""}{target}',
+        'color': f'btn-{color}',
+        'classes': classes or '',
+    }
+
+
+@register.inclusion_tag('builtins/htmx_table.html', takes_context=True)
+def htmx_table(context, viewname, return_url=None, **kwargs):
+    """
+    Embed an object list table retrieved using HTMX. Any extra keyword arguments are passed as URL query parameters.
+
+    Args:
+        context: The current request context
+        viewname: The name of the view to use for the HTMX request (e.g. `dcim:site_list`)
+        return_url: The URL to pass as the `return_url`. If not provided, the current request's path will be used.
+    """
+    url_params = dict_to_querydict(kwargs)
+    url_params['return_url'] = return_url or context['request'].path
+    return {
+        'viewname': viewname,
+        'url_params': url_params,
+    }
+
+
+@register.simple_tag(takes_context=True)
+def formaction(context):
+    """
+    A hook for overriding the 'formaction' attribute on an HTML element, for example to replace
+    with 'hx-push-url="true" hx-post' for HTMX navigation.
+    """
+    return 'formaction'
+
+
+@register.simple_tag
+def static_with_params(path, **params):
+    """
+    Generate a static URL with properly appended query parameters.
+
+    The original Django static tag doesn't properly handle appending new parameters to URLs
+    that already contain query parameters, which can result in malformed URLs with double
+    question marks. This template tag handles the case where static files are served from
+    AWS S3 or other CDNs that automatically append query parameters to URLs.
+
+    This implementation correctly appends new parameters to existing URLs and checks for
+    parameter conflicts. A warning will be logged if any of the provided parameters
+    conflict with existing parameters in the URL.
+
+    URLs which have been cryptographically signed by the storage backend (e.g. S3 presigned
+    URLs) are returned unmodified, as appending parameters to them would invalidate their
+    signature. Such URLs embed an expiration and are regenerated on each request, so they
+    require no cache-busting parameters.
+
+    Args:
+        path: The static file path (e.g., 'setmode.js')
+        **params: Query parameters to append (e.g., v='4.3.1')
+
+    Returns:
+        A properly formatted URL with query parameters.
+
+    Note:
+        If any provided parameters conflict with existing URL parameters, a warning
+        will be logged and the new parameter value will override the existing one.
+    """
+    logger = logging.getLogger('netbox.utilities.templatetags.tags')
+
+    # Get the base static URL
+    static_url = static(path)
+
+    # Parse the URL to extract existing query parameters
+    parsed = urlparse(static_url)
+    existing_params = parse_qs(parsed.query)
+
+    # If the storage backend has signed the URL, return it as-is. Signature schemes such as AWS
+    # signature v4 cover the entire query string, so appending a parameter here would invalidate
+    # the signature and the request would be rejected by the storage backend.
+    if signature_params := [p for p in existing_params if p.lower() in SIGNED_URL_PARAMS]:
+        logger.debug(
+            "Static URL '%s' is signed (%s); omitting parameters %s",
+            static_url, ', '.join(signature_params), tuple(params)
+        )
+        return static_url
+
+    # Check for duplicate parameters and log warnings
+    for key, value in params.items():
+        if key in existing_params:
+            logger.warning(
+                f"Parameter '{key}' already exists in static URL '{static_url}' "
+                f"with value(s) {existing_params[key]}, overwriting with '{value}'"
+            )
+        existing_params[key] = [str(value)]
+
+    # Rebuild the query string
+    new_query = urlencode(existing_params, doseq=True)
+
+    # Reconstruct the URL with the new query string
+    new_parsed = parsed._replace(query=new_query)
+    return urlunparse(new_parsed)
+
+
+@register.simple_tag(takes_context=True)
+def render(context, component):
+    """
+    Render a UI component (e.g. a Panel) by calling its render() method and passing the current template context.
+    """
+    return mark_safe(component.render(context))
+
+
+@register.simple_tag(takes_context=True)
+def render_breadcrumbs(context):
+    """
+    Render the breadcrumb trail for the current object. The trail comprises a default root breadcrumb
+    (a link to the object's list view) followed by any breadcrumbs defined on the layout of the object's
+    base (detail) view. Resolving the trail from the base view—rather than the view currently rendering—
+    ensures that an object's detail view and all of its peer/tabbed views render the same trail. A layout
+    may suppress the default root breadcrumb (e.g. to substitute its own) via `root_breadcrumb=False`.
+    """
+    from netbox.ui.breadcrumbs import get_root_breadcrumb
+    from utilities.views import get_view
+
+    obj = context.get('object')
+    # The object on some pages (e.g. RQ workers/tasks) is not a model instance and has no associated view
+    if obj is None or not hasattr(obj, '_meta'):
+        return ''
+
+    # Pull the breadcrumbs from the layout of the object's base (detail) view
+    layout = getattr(get_view(obj), 'layout', None)
+    breadcrumbs = list(getattr(layout, 'breadcrumbs', None) or [])
+
+    # Prepend the default root breadcrumb unless the layout opts out
+    if getattr(layout, 'root_breadcrumb', True):
+        breadcrumbs.insert(0, get_root_breadcrumb(obj))
+
+    return mark_safe(''.join(breadcrumb.render(context) for breadcrumb in breadcrumbs))

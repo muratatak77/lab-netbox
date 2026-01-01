@@ -1,0 +1,51 @@
+from django.contrib.contenttypes.models import ContentType
+from django.db import models
+from drf_spectacular.utils import extend_schema_field
+from rest_framework import serializers
+
+from core.models import ObjectType
+from netbox.api.fields import ContentTypeField
+from utilities.api import get_serializer_for_model
+from utilities.object_types import object_type_identifier
+
+__all__ = (
+    'GenericObjectSerializer',
+)
+
+
+class GenericObjectSerializer(serializers.Serializer):
+    """
+    Minimal representation of some generic object identified by ContentType and PK.
+    """
+    object_type = ContentTypeField(
+        queryset=ContentType.objects.all()
+    )
+    object_id = serializers.IntegerField(max_value=models.BigIntegerField.MAX_BIGINT)
+    object = serializers.SerializerMethodField(read_only=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._serializer_cache = {}
+
+    def to_internal_value(self, data):
+        data = super().to_internal_value(data)
+        model = data['object_type'].model_class()
+        return model.objects.get(pk=data['object_id'])
+
+    def to_representation(self, instance):
+        object_type = ObjectType.objects.get_for_model(instance)
+        data = {
+            'object_type': object_type_identifier(object_type),
+            'object_id': instance.pk,
+        }
+        if 'request' in self.context:
+            data['object'] = self.get_object(instance)
+
+        return data
+
+    @extend_schema_field(serializers.JSONField(allow_null=True))
+    def get_object(self, obj):
+        if obj.__class__ not in self._serializer_cache:
+            self._serializer_cache[obj.__class__] = get_serializer_for_model(obj)(nested=True, context=self.context)
+        serializer = self._serializer_cache[obj.__class__]
+        return serializer.to_representation(obj)

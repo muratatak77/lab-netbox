@@ -1,0 +1,85 @@
+# Racks
+
+The rack model represents a physical two- or four-post equipment rack in which [devices](./device.md) can be installed. Each rack must be assigned to a [site](./site.md), and may optionally be assigned to a [location](./location.md) within that site. Racks can also be organized by user-defined functional roles or by [rack groups](./rackgroup.md). The name and facility ID of each rack within a location must be unique.
+
+Rack height is measured in *rack units* (U); racks are commonly between 42U and 48U tall, but NetBox allows you to define racks of arbitrary height. A toggle is provided to indicate whether rack units are in ascending (from the ground up) or descending order.
+
+Each rack is assigned a name and (optionally) a separate facility ID. This is helpful when leasing space in a data center your organization does not own: The facility will often assign a seemingly arbitrary ID to a rack (for example, "M204.313") whereas internally you refer to is simply as "R113." A unique serial number and asset tag may also be associated with each rack.
+
+## Fields
+
+### Site
+
+The [site](./site.md) to which the rack is assigned.
+
+### Location
+
+The [location](./location.md) within a site where the rack has been installed (optional).
+
+### Rack Group
+
+The [group](./rackgroup.md) used to organize racks by physical placement (optional).
+
+### Name
+
+The rack's name or identifier. Must be unique to the rack's location, if assigned.
+
+### Rack Type
+
+The [physical type](./racktype.md) of this rack. The rack type defines physical attributes such as height and weight.
+
+!!! warning "Rack type assignment will become mandatory"
+    Beginning in NetBox v5.0, the assignment of a rack type will be required, and several physical attributes will be inferred from it rather than being set directly on the rack. See the note under [Physical Attributes](#physical-attributes) below.
+
+### Status
+
+Operational status.
+
+!!! tip
+    Additional statuses may be defined by setting `Rack.status` under the [`FIELD_CHOICES`](../../configuration/data-validation.md#field_choices) configuration parameter.
+
+### Role
+
+The functional [role](./rackrole.md) fulfilled by the rack.
+
+### Facility ID
+
+An alternative identifier assigned to the rack e.g. by the facility operator. This is helpful for tracking datacenter rack designations in a colocation facility.
+
+### Serial Number
+
+The unique physical serial number assigned to this rack.
+
+### Asset Tag
+
+A unique, locally-administered label used to identify hardware resources.
+
+### Cooling Capability
+
+Describes how the rack is able to cool the equipment installed in it, which indicates what kind of equipment it can accommodate:
+
+- **Air-only**: The rack is cooled by airflow only; no coolant is delivered to it. Only air-cooled equipment can be installed.
+- **Hybrid**: Coolant can be delivered to the rack (e.g. via a [cooling feed](./coolingfeed.md)), but it can also house air-cooled equipment. Suitable for mixed or hybrid deployments.
+- **Liquid-only**: The rack is intended exclusively for liquid-cooled equipment (such as direct-to-chip or immersion systems) and does not provide adequate air cooling on its own.
+
+This attribute documents the rack's intended use so that incompatible equipment—such as high-density liquid-cooled hardware in an air-only rack—can be identified. When the rack is assigned a [rack type](./racktype.md), this value is inherited from the rack type.
+
+### Cooling Capacity
+
+The rack's cooling capacity, expressed in kilowatts (kW). When the rack is assigned a [rack type](./racktype.md), this value is inherited from the rack type.
+
+## Physical Attributes
+
+Several physical attributes may be defined on each rack, including its width, height, outer dimensions, mounting depth, and weight. These should generally be defined on the [rack type](./racktype.md) assigned to the rack rather than on the rack itself.
+
+!!! warning "Some rack fields are deprecated"
+    The following fields have been **deprecated** on the rack model and are planned for removal in NetBox v5.0:
+
+    * Form factor
+    * Width
+    * Outer width
+    * Outer height
+    * Outer depth
+    * Outer unit
+
+    In a future release, the values for these attributes will be inferred from the rack's assigned [rack type](./racktype.md), which will become a mandatory assignment. Users are strongly encouraged to define these attributes on a rack type and assign it to each rack. (Note that the U height, starting unit, descending units, and mounting depth fields will be retained on the rack model, as these may legitimately vary among individual racks of the same type.)

@@ -1,0 +1,346 @@
+import decimal
+from functools import cached_property
+
+from django.contrib.contenttypes.models import ContentType
+from django.utils.translation import gettext as _
+from drf_spectacular.utils import extend_schema_field
+from rest_framework import serializers
+
+from dcim.choices import *
+from dcim.constants import MACADDRESS_ASSIGNMENT_MODELS, MODULE_TOKEN
+from dcim.models import Device, DeviceBay, MACAddress, Module, VirtualDeviceContext
+from dcim.utils import get_module_bay_positions, resolve_module_placeholder
+from extras.api.serializers_.configtemplates import ConfigTemplateSerializer
+from ipam.api.serializers_.ip import IPAddressSerializer
+from netbox.api.fields import ChoiceField, ContentTypeField, RelatedObjectCountField
+from netbox.api.gfk_fields import GFKSerializerField
+from netbox.api.serializers import PrimaryModelSerializer
+from tenancy.api.serializers_.tenants import TenantSerializer
+from virtualization.api.serializers_.clusters import ClusterSerializer
+
+from .devicetypes import *
+from .nested import NestedDeviceBaySerializer, NestedDeviceSerializer, NestedModuleBaySerializer
+from .platforms import PlatformSerializer
+from .racks import RackSerializer
+from .roles import DeviceRoleSerializer
+from .sites import LocationSerializer, SiteSerializer
+from .virtualchassis import VirtualChassisSerializer
+
+__all__ = (
+    'DeviceSerializer',
+    'MACAddressSerializer',
+    'ModuleSerializer',
+    'VirtualDeviceContextSerializer',
+)
+
+
+class DeviceSerializer(PrimaryModelSerializer):
+    device_type = DeviceTypeSerializer(nested=True)
+    role = DeviceRoleSerializer(nested=True)
+    tenant = TenantSerializer(
+        nested=True,
+        required=False,
+        allow_null=True,
+        default=None
+    )
+    platform = PlatformSerializer(nested=True, required=False, allow_null=True)
+    site = SiteSerializer(nested=True)
+    location = LocationSerializer(nested=True, required=False, allow_null=True, default=None)
+    rack = RackSerializer(nested=True, required=False, allow_null=True, default=None)
+    face = ChoiceField(choices=DeviceFaceChoices, allow_blank=True, default=lambda: '')
+    position = serializers.DecimalField(
+        max_digits=4,
+        decimal_places=1,
+        allow_null=True,
+        label=_('Position (U)'),
+        min_value=decimal.Decimal(0.5),
+        default=None
+    )
+    status = ChoiceField(choices=DeviceStatusChoices, required=False)
+    airflow = ChoiceField(choices=DeviceAirflowChoices, allow_blank=True, required=False)
+    cooling_method = ChoiceField(choices=CoolingMethodChoices, allow_blank=True, required=False, allow_null=True)
+    primary_ip = IPAddressSerializer(
+        nested=True,
+        read_only=True,
+        allow_null=True,
+        fields=[*IPAddressSerializer.Meta.brief_fields, 'dns_name', 'nat_inside', 'nat_outside'],
+    )
+    primary_ip4 = IPAddressSerializer(
+        nested=True,
+        required=False,
+        allow_null=True,
+        fields=[*IPAddressSerializer.Meta.brief_fields, 'dns_name', 'nat_inside', 'nat_outside'],
+    )
+    primary_ip6 = IPAddressSerializer(
+        nested=True,
+        required=False,
+        allow_null=True,
+        fields=[*IPAddressSerializer.Meta.brief_fields, 'dns_name', 'nat_inside', 'nat_outside'],
+    )
+    oob_ip = IPAddressSerializer(
+        nested=True,
+        required=False,
+        allow_null=True,
+        fields=[*IPAddressSerializer.Meta.brief_fields, 'dns_name', 'nat_inside', 'nat_outside'],
+    )
+    parent_device = serializers.SerializerMethodField()
+    cluster = ClusterSerializer(nested=True, required=False, allow_null=True)
+    virtual_chassis = VirtualChassisSerializer(nested=True, required=False, allow_null=True, default=None)
+    vc_position = serializers.IntegerField(allow_null=True, max_value=255, min_value=0, default=None)
+    config_template = ConfigTemplateSerializer(nested=True, required=False, allow_null=True, default=None)
+    config_context = serializers.SerializerMethodField(read_only=True)
+
+    # Counter fields
+    console_port_count = serializers.IntegerField(read_only=True)
+    console_server_port_count = serializers.IntegerField(read_only=True)
+    power_port_count = serializers.IntegerField(read_only=True)
+    power_outlet_count = serializers.IntegerField(read_only=True)
+    interface_count = serializers.IntegerField(read_only=True)
+    front_port_count = serializers.IntegerField(read_only=True)
+    rear_port_count = serializers.IntegerField(read_only=True)
+    device_bay_count = serializers.IntegerField(read_only=True)
+    module_bay_count = serializers.IntegerField(read_only=True)
+    inventory_item_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Device
+        fields = [
+            'id', 'url', 'display_url', 'display', 'name', 'device_type', 'role', 'tenant', 'platform', 'serial',
+            'asset_tag', 'site', 'location', 'rack', 'position', 'face', 'latitude', 'longitude', 'parent_device',
+            'status', 'airflow', 'cooling_method', 'primary_ip', 'primary_ip4', 'primary_ip6', 'oob_ip', 'cluster',
+            'virtual_chassis', 'vc_position', 'vc_priority', 'description', 'owner', 'comments', 'config_template',
+            'config_context',
+            'local_context_data', 'tags', 'custom_fields', 'created', 'last_updated', 'console_port_count',
+            'console_server_port_count', 'power_port_count', 'power_outlet_count', 'cooling_intake_count',
+            'cooling_outflow_count', 'interface_count', 'front_port_count', 'rear_port_count', 'device_bay_count',
+            'module_bay_count', 'inventory_item_count',
+        ]
+        brief_fields = ('id', 'url', 'display', 'name', 'description')
+
+    @cached_property
+    def _parent_device_serializer(self):
+        return NestedDeviceSerializer(context={'request': self.context['request']})
+
+    @cached_property
+    def _parent_bay_serializer(self):
+        return NestedDeviceBaySerializer(context={'request': self.context['request']})
+
+    @extend_schema_field(NestedDeviceSerializer(allow_null=True))
+    def get_parent_device(self, obj):
+        try:
+            device_bay = obj.parent_bay
+        except DeviceBay.DoesNotExist:
+            return None
+        data = self._parent_device_serializer.to_representation(device_bay.device)
+        data['device_bay'] = self._parent_bay_serializer.to_representation(device_bay)
+        return data
+
+    @extend_schema_field(serializers.JSONField(allow_null=True))
+    def get_config_context(self, obj):
+        return obj.get_config_context(copy_data=False)
+
+
+class VirtualDeviceContextSerializer(PrimaryModelSerializer):
+    device = DeviceSerializer(nested=True)
+    identifier = serializers.IntegerField(allow_null=True, max_value=32767, min_value=0, required=False, default=None)
+    tenant = TenantSerializer(nested=True, required=False, allow_null=True, default=None)
+    primary_ip = IPAddressSerializer(
+        nested=True,
+        read_only=True,
+        allow_null=True,
+        fields=[*IPAddressSerializer.Meta.brief_fields, 'dns_name', 'nat_inside', 'nat_outside'],
+    )
+    primary_ip4 = IPAddressSerializer(
+        nested=True,
+        required=False,
+        allow_null=True,
+        fields=[*IPAddressSerializer.Meta.brief_fields, 'dns_name', 'nat_inside', 'nat_outside'],
+    )
+    primary_ip6 = IPAddressSerializer(
+        nested=True,
+        required=False,
+        allow_null=True,
+        fields=[*IPAddressSerializer.Meta.brief_fields, 'dns_name', 'nat_inside', 'nat_outside'],
+    )
+    status = ChoiceField(choices=VirtualDeviceContextStatusChoices)
+
+    # Related object counts
+    interface_count = RelatedObjectCountField('interfaces')
+
+    class Meta:
+        model = VirtualDeviceContext
+        fields = [
+            'id', 'url', 'display_url', 'display', 'name', 'device', 'identifier', 'tenant', 'primary_ip',
+            'primary_ip4', 'primary_ip6', 'status', 'description', 'owner', 'comments', 'tags', 'custom_fields',
+            'created', 'last_updated', 'interface_count',
+        ]
+        brief_fields = ('id', 'url', 'display', 'name', 'identifier', 'device', 'description')
+
+
+class ModuleSerializer(PrimaryModelSerializer):
+    device = DeviceSerializer(nested=True)
+    module_bay = NestedModuleBaySerializer()
+    module_type = ModuleTypeSerializer(nested=True)
+    status = ChoiceField(choices=ModuleStatusChoices, required=False)
+    replicate_components = serializers.BooleanField(
+        required=False,
+        default=True,
+        write_only=True,
+        label=_('Replicate components'),
+        help_text=_('Automatically populate components associated with this module type (default: true)')
+    )
+    adopt_components = serializers.BooleanField(
+        required=False,
+        default=False,
+        write_only=True,
+        label=_('Adopt components'),
+        help_text=_('Adopt already existing components')
+    )
+    is_bay_compatible = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Module
+        fields = [
+            'id', 'url', 'display_url', 'display', 'device', 'module_bay', 'module_type', 'status', 'serial',
+            'asset_tag', 'description', 'owner', 'comments', 'tags', 'custom_fields', 'created', 'last_updated',
+            'replicate_components', 'adopt_components', 'is_bay_compatible',
+        ]
+        brief_fields = ('id', 'url', 'display', 'device', 'module_bay', 'module_type', 'description')
+
+    def validate(self, data):
+        # Pop write-only transient fields before ValidatedModelSerializer tries to
+        # construct a Module instance for full_clean(); restore them afterwards.
+        replicate_components = data.pop('replicate_components', True)
+        adopt_components = data.pop('adopt_components', False)
+
+        if self.instance is not None:
+            # Derive device from module_bay so full_clean() validates a consistent pair.
+            if 'module_bay' in data and 'device' not in data:
+                data['device'] = data['module_bay'].device
+            move_requested = (
+                ('module_bay' in data and data['module_bay'].pk != self.instance.module_bay_id) or
+                ('device' in data and data['device'].pk != self.instance.device_id)
+            )
+            if move_requested and 'module_type' in data and data['module_type'].pk != self.instance.module_type_id:
+                raise serializers.ValidationError({
+                    'module_type': _(
+                        "Changing a module's type while moving it is not supported. Change the module "
+                        "type and move the module as separate operations."
+                    )
+                })
+
+        data = super().validate(data)
+
+        # For updates these fields are not meaningful; omit them from validated_data so that
+        # ModelSerializer.update() does not set unexpected attributes on the instance.
+        if self.instance:
+            return data
+
+        # Always pass the flags to create() so it can set the correct private attributes.
+        data['replicate_components'] = replicate_components
+        data['adopt_components'] = adopt_components
+
+        # Skip conflict checks when no component operations are requested.
+        if not replicate_components and not adopt_components:
+            return data
+
+        device = data.get('device')
+        module_type = data.get('module_type')
+        module_bay = data.get('module_bay')
+
+        # Required-field validation fires separately; skip here if any are missing.
+        if not all([device, module_type, module_bay]):
+            return data
+
+        try:
+            positions = get_module_bay_positions(module_bay)
+        except ValueError as e:
+            raise serializers.ValidationError({'module_bay': str(e)}) from e
+
+        for templates_attr, component_attr in [
+            ('consoleporttemplates', 'consoleports'),
+            ('consoleserverporttemplates', 'consoleserverports'),
+            ('interfacetemplates', 'interfaces'),
+            ('powerporttemplates', 'powerports'),
+            ('poweroutlettemplates', 'poweroutlets'),
+            ('coolingintaketemplates', 'coolingintakes'),
+            ('coolingoutflowtemplates', 'coolingoutflows'),
+            ('rearporttemplates', 'rearports'),
+            ('frontporttemplates', 'frontports'),
+        ]:
+            installed_components = {
+                component.name: component
+                for component in getattr(device, component_attr).all()
+            }
+
+            for template in getattr(module_type, templates_attr).all():
+                resolved_name = template.name
+                if MODULE_TOKEN in template.name:
+                    if not module_bay.position:
+                        raise serializers.ValidationError(
+                            _("Cannot install module with placeholder values in a module bay with no position defined.")
+                        )
+                    try:
+                        resolved_name = resolve_module_placeholder(template.name, positions)
+                    except ValueError as e:
+                        raise serializers.ValidationError(str(e))
+
+                existing_item = installed_components.get(resolved_name)
+
+                if adopt_components and existing_item and existing_item.module:
+                    raise serializers.ValidationError(
+                        _("Cannot adopt {model} {name} as it already belongs to a module").format(
+                            model=template.component_model.__name__,
+                            name=resolved_name
+                        )
+                    )
+
+                if not adopt_components and resolved_name in installed_components:
+                    raise serializers.ValidationError(
+                        _("A {model} named {name} already exists").format(
+                            model=template.component_model.__name__,
+                            name=resolved_name
+                        )
+                    )
+
+        return data
+
+    def create(self, validated_data):
+        replicate_components = validated_data.pop('replicate_components', True)
+        adopt_components = validated_data.pop('adopt_components', False)
+
+        # Tags are handled after save; pop them here to pass to _save_tags()
+        tags = validated_data.pop('tags', None)
+
+        # _adopt_components and _disable_replication must be set on the instance before
+        # save() is called, so we cannot delegate to super().create() here.
+        instance = self.Meta.model(**validated_data)
+        if adopt_components:
+            instance._adopt_components = True
+        if not replicate_components:
+            instance._disable_replication = True
+        instance.save()
+
+        if tags is not None:
+            self._save_tags(instance, tags)
+
+        return instance
+
+
+class MACAddressSerializer(PrimaryModelSerializer):
+    assigned_object_type = ContentTypeField(
+        queryset=ContentType.objects.filter(MACADDRESS_ASSIGNMENT_MODELS),
+        required=False,
+        allow_null=True
+    )
+    assigned_object = GFKSerializerField(read_only=True)
+    is_primary = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = MACAddress
+        fields = [
+            'id', 'url', 'display_url', 'display', 'mac_address', 'assigned_object_type', 'assigned_object_id',
+            'assigned_object', 'is_primary', 'description', 'owner', 'comments', 'tags', 'custom_fields', 'created',
+            'last_updated',
+        ]
+        brief_fields = ('id', 'url', 'display', 'mac_address', 'description')

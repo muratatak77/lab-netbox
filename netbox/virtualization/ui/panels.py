@@ -1,0 +1,113 @@
+from django.utils.translation import gettext_lazy as _
+
+from netbox.ui import attrs, panels
+
+#
+# Cluster
+#
+
+
+class ClusterPanel(panels.ObjectAttributesPanel):
+    name = attrs.TextAttr('name')
+    type = attrs.RelatedObjectAttr('type', linkify=True)
+    status = attrs.ChoiceAttr('status')
+    description = attrs.TextAttr('description')
+    group = attrs.RelatedObjectAttr('group', linkify=True)
+    tenant = attrs.RelatedObjectAttr('tenant', linkify=True, grouped_by='group')
+    scope = attrs.GenericForeignKeyAttr('scope', linkify=True, nested=True, max_depth=3)
+
+
+#
+# Virtual machine types
+#
+
+
+class VirtualMachineTypePanel(panels.ObjectAttributesPanel):
+    name = attrs.TextAttr('name')
+    default_platform = attrs.NestedObjectAttr('default_platform', linkify=True, max_depth=3)
+    default_vcpus = attrs.TextAttr('default_vcpus', label=_('Default vCPUs'))
+    default_memory = attrs.TemplatedAttr(
+        'default_memory',
+        template_name='virtualization/virtualmachinetype/attrs/default_memory.html',
+        label=_('Default memory')
+    )
+    description = attrs.TextAttr('description')
+
+
+#
+# Virtual machines
+#
+
+
+class VirtualMachinePanel(panels.ObjectAttributesPanel):
+    name = attrs.TextAttr('name')
+    virtual_machine_type = attrs.RelatedObjectAttr('virtual_machine_type', linkify=True, label=_('Type'))
+    status = attrs.ChoiceAttr('status')
+    start_on_boot = attrs.ChoiceAttr('start_on_boot')
+    role = attrs.NestedObjectAttr('role', linkify=True, max_depth=3, colored=True)
+    platform = attrs.NestedObjectAttr('platform', linkify=True, max_depth=3)
+    description = attrs.TextAttr('description')
+    serial = attrs.TextAttr('serial', label=_('Serial number'), style='font-monospace', copy_button=True)
+    tenant = attrs.RelatedObjectAttr('tenant', linkify=True, grouped_by='group')
+    config_template = attrs.RelatedObjectAttr('config_template', linkify=True)
+    primary_ip4 = attrs.TemplatedAttr(
+        'primary_ip4',
+        label=_('Primary IPv4'),
+        template_name='virtualization/virtualmachine/attrs/ipaddress.html',
+    )
+    primary_ip6 = attrs.TemplatedAttr(
+        'primary_ip6',
+        label=_('Primary IPv6'),
+        template_name='virtualization/virtualmachine/attrs/ipaddress.html',
+    )
+
+
+class VirtualMachinePlacementPanel(panels.ObjectAttributesPanel):
+    title = _('Placement')
+
+    site = attrs.RelatedObjectAttr('site', linkify=True, grouped_by='group')
+    cluster = attrs.RelatedObjectAttr('cluster', linkify=True, grouped_by='group')
+    cluster_type = attrs.RelatedObjectAttr('cluster.type', linkify=True)
+    device = attrs.RelatedObjectAttr('device', linkify=True)
+
+
+#
+# Virtual disks
+#
+
+
+class VirtualDiskPanel(panels.ObjectAttributesPanel):
+    virtual_machine = attrs.RelatedObjectAttr('virtual_machine', linkify=True, label=_('Virtual Machine'))
+    name = attrs.TextAttr('name')
+    size = attrs.TemplatedAttr('size', template_name='virtualization/virtualdisk/attrs/size.html')
+    description = attrs.TextAttr('description')
+
+
+#
+# VM interfaces
+#
+
+
+class VMInterfacePanel(panels.ObjectAttributesPanel):
+    virtual_machine = attrs.RelatedObjectAttr('virtual_machine', linkify=True, label=_('Virtual Machine'))
+    name = attrs.TextAttr('name')
+    enabled = attrs.BooleanAttr('enabled')
+    parent = attrs.RelatedObjectAttr('parent_interface', linkify=True)
+    bridge = attrs.RelatedObjectAttr('bridge', linkify=True)
+    description = attrs.TextAttr('description')
+    mtu = attrs.TextAttr('mtu', label=_('MTU'))
+    mode = attrs.ChoiceAttr('mode', label=_('802.1Q Mode'))
+    qinq_svlan = attrs.RelatedObjectAttr('qinq_svlan', linkify=True, label=_('Q-in-Q SVLAN'))
+    tunnel_termination = attrs.RelatedObjectAttr('tunnel_termination.tunnel', linkify=True, label=_('Tunnel'))
+
+
+class VMInterfaceAddressingPanel(panels.ObjectAttributesPanel):
+    title = _('Addressing')
+
+    primary_mac_address = attrs.TextAttr(
+        'primary_mac_address', label=_('MAC Address'), style='font-monospace', copy_button=True
+    )
+    vrf = attrs.RelatedObjectAttr('vrf', linkify=True, label=_('VRF'))
+    vlan_translation_policy = attrs.RelatedObjectAttr(
+        'vlan_translation_policy', linkify=True, label=_('VLAN Translation')
+    )

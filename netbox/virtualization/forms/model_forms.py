@@ -1,0 +1,531 @@
+from django import forms
+from django.apps import apps
+from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
+from django.utils.translation import gettext_lazy as _
+
+from dcim.choices import InterfaceModeChoices
+from dcim.forms.common import InterfaceCommonForm
+from dcim.forms.mixins import ScopedForm
+from dcim.models import Device, DeviceRole, MACAddress, Platform, Rack, Region, Site, SiteGroup
+from extras.models import ConfigTemplate
+from ipam.choices import VLANQinQRoleChoices
+from ipam.models import VLAN, VRF, IPAddress, VLANGroup, VLANTranslationPolicy
+from netbox.forms import NetBoxModelForm, OrganizationalModelForm, PrimaryModelForm
+from netbox.forms.mixins import OwnerMixin
+from tenancy.forms import TenancyForm
+from utilities.forms import ConfirmationForm, add_blank_choice, get_field_value
+from utilities.forms.fields import (
+    ChoiceField,
+    DynamicModelChoiceField,
+    DynamicModelMultipleChoiceField,
+    JSONField,
+    SlugField,
+    TypedChoiceField,
+)
+from utilities.forms.rendering import FieldSet
+from utilities.forms.utils import get_capacity_unit_label
+from utilities.forms.widgets import HTMXSelect
+from virtualization.choices import (
+    ClusterStatusChoices,
+    VirtualMachineStartOnBootChoices,
+    VirtualMachineStatusChoices,
+)
+
+from ..models import *
+
+__all__ = (
+    'ClusterAddDevicesForm',
+    'ClusterForm',
+    'ClusterGroupForm',
+    'ClusterRemoveDevicesForm',
+    'ClusterTypeForm',
+    'VMInterfaceForm',
+    'VirtualDiskForm',
+    'VirtualMachineForm',
+    'VirtualMachineTypeForm',
+)
+
+
+class ClusterTypeForm(OrganizationalModelForm):
+    fieldsets = (
+        FieldSet('name', 'slug', 'description', 'tags', name=_('Cluster Type')),
+    )
+
+    class Meta:
+        model = ClusterType
+        fields = (
+            'name', 'slug', 'description', 'owner', 'comments', 'tags',
+        )
+
+
+class ClusterGroupForm(OrganizationalModelForm):
+    fieldsets = (
+        FieldSet('name', 'slug', 'description', 'tags', name=_('Cluster Group')),
+    )
+
+    class Meta:
+        model = ClusterGroup
+        fields = (
+            'name', 'slug', 'description', 'owner', 'comments', 'tags',
+        )
+
+
+class ClusterForm(TenancyForm, ScopedForm, PrimaryModelForm):
+    status = ChoiceField(
+        label=_('Status'),
+        choices=ClusterStatusChoices,
+        initial=ClusterStatusChoices.STATUS_ACTIVE,
+    )
+    type = DynamicModelChoiceField(
+        label=_('Type'),
+        queryset=ClusterType.objects.all(),
+        quick_add=True
+    )
+    group = DynamicModelChoiceField(
+        label=_('Group'),
+        queryset=ClusterGroup.objects.all(),
+        required=False,
+        quick_add=True
+    )
+
+    fieldsets = (
+        FieldSet('name', 'type', 'group', 'status', 'description', 'tags', name=_('Cluster')),
+        FieldSet('scope', name=_('Scope'), html_id='scope'),
+        FieldSet('tenant_group', 'tenant', name=_('Tenancy')),
+    )
+
+    class Meta:
+        model = Cluster
+        fields = (
+            'name', 'type', 'group', 'status', 'tenant', 'description', 'owner', 'comments', 'tags',
+        )
+
+
+class ClusterAddDevicesForm(forms.Form):
+    region = DynamicModelChoiceField(
+        label=_('Region'),
+        queryset=Region.objects.all(),
+        required=False,
+        null_option='None'
+    )
+    site_group = DynamicModelChoiceField(
+        label=_('Site group'),
+        queryset=SiteGroup.objects.all(),
+        required=False,
+        null_option='None'
+    )
+    site = DynamicModelChoiceField(
+        label=_('Site'),
+        queryset=Site.objects.all(),
+        required=False,
+        query_params={
+            'region_id': '$region',
+            'group_id': '$site_group',
+        }
+    )
+    rack = DynamicModelChoiceField(
+        label=_('Rack'),
+        queryset=Rack.objects.all(),
+        required=False,
+        null_option='None',
+        query_params={
+            'site_id': '$site'
+        }
+    )
+    devices = DynamicModelMultipleChoiceField(
+        label=_('Devices'),
+        queryset=Device.objects.all(),
+        query_params={
+            'site_id': '$site',
+            'rack_id': '$rack',
+            'cluster_id': 'null',
+        }
+    )
+
+    class Meta:
+        fields = [
+            'region', 'site', 'rack', 'devices',
+        ]
+
+    def __init__(self, cluster, *args, **kwargs):
+
+        self.cluster = cluster
+
+        super().__init__(*args, **kwargs)
+
+        self.fields['devices'].choices = []
+
+    def clean(self):
+        super().clean()
+
+        # If the Cluster is assigned to a Site or Location, all Devices must be assigned to that same scope.
+        if self.cluster.scope is not None:
+            for device in self.cleaned_data.get('devices', []):
+                for scope_field in ['site', 'location']:
+                    device_scope = getattr(device, scope_field)
+                    if (
+                        self.cluster.scope_type.model_class() == apps.get_model('dcim', scope_field) and
+                            device_scope != self.cluster.scope
+                    ):
+                        raise ValidationError({
+                            'devices': _(
+                                "{device} belongs to a different {scope_field} ({device_scope}) than the "
+                                "cluster ({cluster_scope})"
+                            ).format(
+                                device=device,
+                                scope_field=scope_field,
+                                device_scope=device_scope,
+                                cluster_scope=self.cluster.scope
+                            )
+                        })
+
+
+class ClusterRemoveDevicesForm(ConfirmationForm):
+    pk = forms.ModelMultipleChoiceField(
+        queryset=Device.objects.all(),
+        widget=forms.MultipleHiddenInput()
+    )
+
+
+class VirtualMachineTypeForm(PrimaryModelForm):
+    slug = SlugField()
+    default_platform = DynamicModelChoiceField(
+        label=_('Default platform'),
+        queryset=Platform.objects.all(),
+        required=False,
+        selector=True,
+    )
+
+    fieldsets = (
+        FieldSet('name', 'slug', 'description', 'tags', name=_('Virtual Machine Type')),
+        FieldSet('default_platform', 'default_vcpus', 'default_memory', name=_('Defaults')),
+    )
+
+    class Meta:
+        model = VirtualMachineType
+        fields = (
+            'name', 'slug', 'default_platform', 'default_vcpus', 'default_memory', 'description',
+            'owner', 'comments', 'tags',
+        )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Set unit label based on configured RAM_BASE_UNIT (MB vs MiB)
+        self.fields['default_memory'].label = _('Default memory ({unit})').format(
+            unit=get_capacity_unit_label(settings.RAM_BASE_UNIT)
+        )
+
+
+class VirtualMachineForm(TenancyForm, PrimaryModelForm):
+    status = ChoiceField(
+        label=_('Status'),
+        choices=VirtualMachineStatusChoices,
+        initial=VirtualMachineStatusChoices.STATUS_ACTIVE,
+    )
+    start_on_boot = ChoiceField(
+        label=_('Start on boot'),
+        choices=VirtualMachineStartOnBootChoices,
+        initial=VirtualMachineStartOnBootChoices.STATUS_OFF,
+    )
+    virtual_machine_type = forms.ModelChoiceField(
+        label=_('Type'),
+        queryset=VirtualMachineType.objects.all(),
+        required=False,
+        # No hx_target_id: type change populates defaults across both the Virtual Machine
+        # and Resources fieldsets, so a single-fieldset partial swap would miss half the update.
+        widget=HTMXSelect(),
+    )
+    site = DynamicModelChoiceField(
+        label=_('Site'),
+        queryset=Site.objects.all(),
+        required=False,
+        help_text=_(
+            'The site where this VM resides. Will be inferred automatically from the '
+            'assigned cluster or device if left blank.'
+        ),
+    )
+    cluster = DynamicModelChoiceField(
+        label=_('Cluster'),
+        queryset=Cluster.objects.all(),
+        required=False,
+        selector=True,
+        query_params={
+            'site_id': ['$site', 'null']
+        },
+        help_text=_('Assign this VM to a cluster. Required when selecting a device that belongs to a cluster.'),
+    )
+    device = DynamicModelChoiceField(
+        label=_('Device'),
+        queryset=Device.objects.all(),
+        required=False,
+        selector=True,
+        query_params={
+            'cluster_id': '$cluster',
+            'site_id': '$site',
+        },
+        help_text=_(
+            'Optionally pin this VM to a specific host device within a cluster, '
+            'or assign it directly to a standalone device.'
+        )
+    )
+    role = DynamicModelChoiceField(
+        label=_('Role'),
+        queryset=DeviceRole.objects.all(),
+        required=False,
+        query_params={
+            "vm_role": "True"
+        }
+    )
+    platform = DynamicModelChoiceField(
+        label=_('Platform'),
+        queryset=Platform.objects.all(),
+        required=False,
+        selector=True
+    )
+    local_context_data = JSONField(
+        required=False,
+        label='',
+        widget=forms.Textarea(attrs={'aria-label': _('Local config context data')})
+    )
+    config_template = DynamicModelChoiceField(
+        queryset=ConfigTemplate.objects.all(),
+        required=False,
+        label=_('Config template')
+    )
+
+    fieldsets = (
+        FieldSet(
+            'name', 'virtual_machine_type', 'role', 'status', 'start_on_boot', 'description', 'serial', 'tags',
+            name=_('Virtual Machine')
+        ),
+        FieldSet('site', 'cluster', 'device', name=_('Placement')),
+        FieldSet('tenant_group', 'tenant', name=_('Tenancy')),
+        FieldSet('platform', 'primary_ip4', 'primary_ip6', 'config_template', name=_('Management')),
+        FieldSet('vcpus', 'memory', 'disk', name=_('Resources')),
+        FieldSet('local_context_data', name=_('Config Context')),
+    )
+
+    class Meta:
+        model = VirtualMachine
+        fields = [
+            'name', 'virtual_machine_type', 'role', 'status', 'start_on_boot', 'site', 'cluster', 'device',
+            'platform', 'primary_ip4', 'primary_ip6', 'vcpus', 'memory', 'disk', 'description', 'serial',
+            'tenant_group', 'tenant', 'owner', 'comments', 'tags', 'local_context_data', 'config_template',
+        ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Set unit labels based on configured RAM_BASE_UNIT / DISK_BASE_UNIT (MB vs MiB)
+        self.fields['memory'].label = _('Memory ({unit})').format(unit=get_capacity_unit_label(settings.RAM_BASE_UNIT))
+        self.fields['disk'].label = _('Disk ({unit})').format(unit=get_capacity_unit_label(settings.DISK_BASE_UNIT))
+
+        # Populate virtual machine type defaults, if any
+        self._populate_virtual_machine_type_defaults()
+
+        if self.instance.pk:
+
+            # Disable the disk field if one or more VirtualDisks have been created
+            if self.instance.virtualdisks.exists():
+                self.fields['disk'].widget.attrs['disabled'] = True
+                self.fields['disk'].help_text = _("Disk size is managed via the attachment of virtual disks.")
+
+            # Compile list of choices for primary IPv4 and IPv6 addresses
+            for family in [4, 6]:
+                ip_choices = [(None, '---------')]
+
+                # Gather PKs of all interfaces belonging to this VM
+                interface_ids = self.instance.interfaces.values_list('pk', flat=True)
+
+                # Collect interface IPs
+                interface_ips = IPAddress.objects.filter(
+                    address__family=family,
+                    assigned_object_type=ContentType.objects.get_for_model(VMInterface),
+                    assigned_object_id__in=interface_ids
+                )
+                if interface_ips:
+                    ip_list = [(ip.id, f'{ip.address} ({ip.assigned_object})') for ip in interface_ips]
+                    ip_choices.append(('Interface IPs', ip_list))
+                # Collect NAT IPs
+                nat_ips = IPAddress.objects.prefetch_related('nat_inside').filter(
+                    address__family=family,
+                    nat_inside__assigned_object_type=ContentType.objects.get_for_model(VMInterface),
+                    nat_inside__assigned_object_id__in=interface_ids
+                )
+                if nat_ips:
+                    ip_list = [(ip.id, f'{ip.address} (NAT)') for ip in nat_ips]
+                    ip_choices.append(('NAT IPs', ip_list))
+                self.fields['primary_ip{}'.format(family)].choices = ip_choices
+
+        else:
+
+            # An object that doesn't exist yet can't have any IPs assigned to it
+            self.fields.pop('primary_ip4')
+            self.fields.pop('primary_ip6')
+
+    def _populate_virtual_machine_type_defaults(self):
+        """
+        Populate platform/vCPUs/memory from the selected VirtualMachineType.
+
+        For new VMs, always apply defaults. For existing VMs, only apply
+        defaults when the type changes and the field is currently empty.
+        """
+        if not (virtual_machine_type_id := get_field_value(self, 'virtual_machine_type')):
+            return
+
+        is_new = not self.instance.pk
+
+        # Skip if editing and the type hasn't changed
+        if not is_new and int(virtual_machine_type_id) == self.instance.virtual_machine_type_id:
+            return
+
+        if not (virtual_machine_type := VirtualMachineType.objects.filter(pk=virtual_machine_type_id).first()):
+            return
+
+        defaults = {
+            'platform': ('default_platform_id', 'platform_id'),
+            'vcpus': ('default_vcpus', 'vcpus'),
+            'memory': ('default_memory', 'memory'),
+        }
+
+        for field_name, (type_attr, instance_attr) in defaults.items():
+            default_value = getattr(virtual_machine_type, type_attr)
+            if default_value is not None and (is_new or getattr(self.instance, instance_attr) is None):
+                self.initial[field_name] = default_value
+
+
+#
+# Virtual machine components
+#
+
+class VMComponentForm(OwnerMixin, NetBoxModelForm):
+    virtual_machine = DynamicModelChoiceField(
+        label=_('Virtual machine'),
+        queryset=VirtualMachine.objects.all(),
+        selector=True
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Disable reassignment of VirtualMachine when editing an existing instance
+        if self.instance.pk:
+            self.fields['virtual_machine'].disabled = True
+
+
+class VMInterfaceForm(InterfaceCommonForm, VMComponentForm):
+    mode = TypedChoiceField(
+        label=_('802.1Q Mode'),
+        choices=add_blank_choice(InterfaceModeChoices),
+        required=False,
+        help_text=_('IEEE 802.1Q tagging strategy'),
+        widget=HTMXSelect(hx_target_id='dot1q-switching'),
+    )
+    primary_mac_address = DynamicModelChoiceField(
+        queryset=MACAddress.objects.all(),
+        label=_('Primary MAC address'),
+        required=False,
+        quick_add=True,
+        quick_add_params={'vminterface': '$pk'}
+    )
+    parent = DynamicModelChoiceField(
+        queryset=VMInterface.objects.all(),
+        required=False,
+        label=_('Parent interface'),
+        query_params={
+            'virtual_machine_id': '$virtual_machine',
+        }
+    )
+    bridge = DynamicModelChoiceField(
+        queryset=VMInterface.objects.all(),
+        required=False,
+        label=_('Bridged interface'),
+        query_params={
+            'virtual_machine_id': '$virtual_machine',
+        }
+    )
+    vlan_group = DynamicModelChoiceField(
+        queryset=VLANGroup.objects.all(),
+        required=False,
+        label=_('VLAN group')
+    )
+    untagged_vlan = DynamicModelChoiceField(
+        queryset=VLAN.objects.all(),
+        required=False,
+        label=_('Untagged VLAN'),
+        query_params={
+            'group_id': '$vlan_group',
+            'available_on_virtualmachine': '$virtual_machine',
+        }
+    )
+    tagged_vlans = DynamicModelMultipleChoiceField(
+        queryset=VLAN.objects.all(),
+        required=False,
+        label=_('Tagged VLANs'),
+        query_params={
+            'group_id': '$vlan_group',
+            'available_on_virtualmachine': '$virtual_machine',
+        }
+    )
+    qinq_svlan = DynamicModelChoiceField(
+        queryset=VLAN.objects.all(),
+        required=False,
+        label=_('Q-in-Q Service VLAN'),
+        query_params={
+            'group_id': '$vlan_group',
+            'available_on_virtualmachine': '$virtual_machine',
+            'qinq_role': VLANQinQRoleChoices.ROLE_SERVICE,
+        }
+    )
+    vrf = DynamicModelChoiceField(
+        queryset=VRF.objects.all(),
+        required=False,
+        label=_('VRF')
+    )
+    vlan_translation_policy = DynamicModelChoiceField(
+        queryset=VLANTranslationPolicy.objects.all(),
+        required=False,
+        label=_('VLAN Translation Policy')
+    )
+
+    fieldsets = (
+        FieldSet('virtual_machine', 'name', 'description', 'tags', name=_('Interface')),
+        FieldSet('vrf', 'mac_address', name=_('Addressing')),
+        FieldSet('mtu', 'enabled', name=_('Operation')),
+        FieldSet('parent', 'bridge', name=_('Related Interfaces')),
+        FieldSet(
+            'mode', 'vlan_group', 'untagged_vlan', 'tagged_vlans', 'qinq_svlan', 'vlan_translation_policy',
+            name=_('802.1Q Switching'),
+            html_id='dot1q-switching',
+        ),
+    )
+
+    class Meta:
+        model = VMInterface
+        fields = [
+            'virtual_machine', 'name', 'parent', 'bridge', 'enabled', 'mtu', 'description', 'mode', 'vlan_group',
+            'untagged_vlan', 'tagged_vlans', 'qinq_svlan', 'vlan_translation_policy', 'vrf',
+            'owner', 'tags',
+        ]
+
+
+class VirtualDiskForm(VMComponentForm):
+
+    fieldsets = (
+        FieldSet('virtual_machine', 'name', 'size', 'description', 'tags', name=_('Disk')),
+    )
+
+    class Meta:
+        model = VirtualDisk
+        fields = [
+            'virtual_machine', 'name', 'size', 'description', 'owner', 'tags',
+        ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Set unit label based on configured DISK_BASE_UNIT (MB vs MiB)
+        self.fields['size'].label = _('Size ({unit})').format(unit=get_capacity_unit_label(settings.DISK_BASE_UNIT))

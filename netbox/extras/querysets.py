@@ -1,0 +1,245 @@
+from django.contrib.postgres.aggregates import JSONBAgg
+from django.db.models import Case, Expression, JSONField, OuterRef, Q, Subquery, When
+
+from extras.models.tags import TaggedItem
+from utilities.query_functions import EmptyGroupByJSONBAgg
+from utilities.querysets import RestrictedQuerySet
+
+__all__ = (
+    'ConfigContextDataExpression',
+    'ConfigContextModelQuerySet',
+    'ConfigContextQuerySet',
+    'NotificationQuerySet',
+    'SharedObjectQuerySet',
+)
+
+
+class ConfigContextQuerySet(RestrictedQuerySet):
+
+    def get_for_object(self, obj, aggregate_data=False):
+        """
+        Return all applicable ConfigContexts for a given object. Only active ConfigContexts will be included.
+
+        WARNING: This method's scope-matching logic is mirrored (inverted) by ConfigContext.get_affected_objects(),
+        which powers cache invalidation. Any change to the matching criteria here MUST be applied there as well, or
+        pre-rendered config context caches will go stale. See extras/models/configs.py.
+
+        Args:
+          aggregate_data: If True, use the JSONBAgg aggregate function to return only the list of JSON data objects
+        """
+
+        # Device type and location assignment are relevant only for Devices
+        device_type = getattr(obj, 'device_type', None)
+        location = getattr(obj, 'location', None)
+        locations = location.get_ancestors(include_self=True) if location else []
+
+        # Get assigned cluster, group, and type (if any)
+        cluster = getattr(obj, 'cluster', None)
+        cluster_type = getattr(cluster, 'type', None)
+        cluster_group = getattr(cluster, 'group', None)
+
+        # Get the group of the assigned tenant, if any
+        tenant_group = obj.tenant.group if obj.tenant else None
+
+        # Match against the directly assigned region as well as any parent regions.
+        region = getattr(obj.site, 'region', None)
+        regions = region.get_ancestors(include_self=True) if region else []
+
+        # Match against the directly assigned site group as well as any parent site groups.
+        sitegroup = getattr(obj.site, 'group', None)
+        sitegroups = sitegroup.get_ancestors(include_self=True) if sitegroup else []
+
+        # Match against the directly assigned role as well as any parent roles.
+        device_roles = obj.role.get_ancestors(include_self=True) if obj.role else []
+
+        # Match against the directly assigned platform as well as any parent platforms.
+        platform = getattr(obj, 'platform', None)
+        platforms = platform.get_ancestors(include_self=True) if platform else []
+
+        queryset = self.filter(
+            Q(regions__in=regions) | Q(regions=None),
+            Q(site_groups__in=sitegroups) | Q(site_groups=None),
+            Q(sites=obj.site) | Q(sites=None),
+            Q(locations__in=locations) | Q(locations=None),
+            Q(device_types=device_type) | Q(device_types=None),
+            Q(roles__in=device_roles) | Q(roles=None),
+            Q(platforms__in=platforms) | Q(platforms=None),
+            Q(cluster_types=cluster_type) | Q(cluster_types=None),
+            Q(cluster_groups=cluster_group) | Q(cluster_groups=None),
+            Q(clusters=cluster) | Q(clusters=None),
+            Q(tenant_groups=tenant_group) | Q(tenant_groups=None),
+            Q(tenants=obj.tenant) | Q(tenants=None),
+            Q(tags__slug__in=obj.tags.slugs()) | Q(tags=None),
+            is_active=True,
+        ).order_by('weight', 'name').distinct()
+
+        if aggregate_data:
+            return queryset.aggregate(
+                config_context_data=JSONBAgg('data', order_by=['weight', 'name'])
+            )['config_context_data']
+
+        return queryset
+
+
+class ConfigContextModelQuerySet(RestrictedQuerySet):
+    """
+    QuerySet manager used by models which support ConfigContext (device and virtual machine).
+
+    Includes a method which appends an annotation of aggregated config context JSON data objects. This is
+    implemented as a subquery which performs all the joins necessary to filter relevant config context objects.
+    This offers a substantial performance gain over ConfigContextQuerySet.get_for_object() when dealing with
+    multiple objects. This allows the annotation to be entirely optional.
+    """
+    def annotate_config_context_data(self, only_invalidated=False):
+        """
+        Attach the subquery annotation to the base queryset. See get_config_context_data_expression().
+        """
+        return self.annotate(config_context_data=self.get_config_context_data_expression(only_invalidated))
+
+    def get_config_context_data_expression(self, only_invalidated=False):
+        """
+        Return the unresolved expression which aggregates the config context data applicable to each row.
+
+        Args:
+            only_invalidated: If True, evaluate the (expensive) aggregation subquery only for rows
+                whose pre-rendered cache (`_config_context_data`) is NULL, returning NULL for rows
+                that already have a populated cache. This is the list/detail read-path optimization:
+                warm rows are served from the cache by ConfigContextModel.get_config_context() and
+                never consult this annotation, so computing it for them is wasted work. PostgreSQL
+                short-circuits CASE branches, so the correlated SubPlan is not executed for warm
+                rows.
+
+                NOTE: With only_invalidated=True the annotation is NULL for warm rows. It is only
+                safe to read via get_config_context() (which short-circuits on the cache before
+                touching the annotation). Do NOT call render_config_context() directly on a row
+                annotated this way, or a warm row would render an empty context.
+        """
+        from extras.models import ConfigContext
+        subquery = Subquery(
+            ConfigContext.objects.filter(
+                self._get_config_context_filters()
+            ).annotate(
+                _data=EmptyGroupByJSONBAgg('data', order_by=['weight', 'name'])
+            ).values("_data").order_by()
+        )
+        if only_invalidated:
+            subquery = Case(
+                When(_config_context_data__isnull=True, then=subquery),
+                default=None,
+                output_field=JSONField(),
+            )
+        return subquery
+
+    def _get_config_context_filters(self):
+        # Construct the set of Q objects for the specific object types
+        tag_query_filters = {
+            "object_id": OuterRef(OuterRef('pk')),
+            "content_type__app_label": self.model._meta.app_label,
+            "content_type__model": self.model._meta.model_name
+        }
+        base_query = Q(
+            Q(cluster_types=OuterRef('cluster__type')) | Q(cluster_types=None),
+            Q(cluster_groups=OuterRef('cluster__group')) | Q(cluster_groups=None),
+            Q(clusters=OuterRef('cluster')) | Q(clusters=None),
+            Q(tenant_groups=OuterRef('tenant__group')) | Q(tenant_groups=None),
+            Q(tenants=OuterRef('tenant')) | Q(tenants=None),
+            Q(sites=OuterRef('site')) | Q(sites=None),
+            Q(
+                tags__pk__in=Subquery(
+                    TaggedItem.objects.filter(
+                        **tag_query_filters
+                    ).values_list(
+                        'tag_id',
+                        flat=True
+                    ).distinct()
+                )
+            ) | Q(tags=None),
+            is_active=True,
+        )
+
+        # Apply Location & DeviceType filters only for VirtualMachines
+        if self.model._meta.model_name == 'device':
+            base_query.add(
+                (Q(
+                    locations__path__ancestor_or_equal=OuterRef('location__path'),
+                ) | Q(locations=None)),
+                Q.AND
+            )
+            base_query.add((Q(device_types=OuterRef('device_type')) | Q(device_types=None)), Q.AND)
+        elif self.model._meta.model_name == 'virtualmachine':
+            base_query.add(Q(locations=None), Q.AND)
+            base_query.add(Q(device_types=None), Q.AND)
+
+        # Ltree-based filters: the ConfigContext-side tree node must be an ancestor
+        # (or equal to) the device/VM-side tree node, i.e. `cc_node.path @> obj_node.path`.
+        base_query.add(
+            (Q(
+                regions__path__ancestor_or_equal=OuterRef('site__region__path'),
+            ) | Q(regions=None)),
+            Q.AND
+        )
+        base_query.add(
+            (Q(
+                site_groups__path__ancestor_or_equal=OuterRef('site__group__path'),
+            ) | Q(site_groups=None)),
+            Q.AND
+        )
+        base_query.add(
+            (Q(
+                roles__path__ancestor_or_equal=OuterRef('role__path'),
+            ) | Q(roles=None)),
+            Q.AND
+        )
+        base_query.add(
+            (Q(
+                platforms__path__ancestor_or_equal=OuterRef('platform__path'),
+            ) | Q(platforms=None)),
+            Q.AND
+        )
+
+        return base_query
+
+
+class ConfigContextDataExpression(Expression):
+    """
+    A model-agnostic form of ConfigContextModelQuerySet.get_config_context_data_expression(), built for the model of
+    the query it is resolved against so its outer references bind to that query's joins.
+    """
+    def __init__(self, only_invalidated=False):
+        super().__init__(output_field=JSONField())
+        self.only_invalidated = only_invalidated
+
+    def resolve_expression(self, query=None, *args, **kwargs):
+        manager = query.model._default_manager
+        if not hasattr(manager, 'get_config_context_data_expression'):
+            raise TypeError(
+                f'{query.model.__name__} must use ConfigContextModelQuerySet to annotate config context data'
+            )
+        expression = manager.get_config_context_data_expression(self.only_invalidated)
+        return expression.resolve_expression(query, *args, **kwargs)
+
+
+class NotificationQuerySet(RestrictedQuerySet):
+
+    def unread(self):
+        """
+        Return only unread notifications.
+        """
+        return self.filter(read__isnull=True)
+
+
+class SharedObjectQuerySet(RestrictedQuerySet):
+
+    def restrict_to_shared(self, user):
+        """
+        Restrict the queryset to objects which are shared or owned by the given user. Superusers are exempt;
+        anonymous users see only shared objects. This enforces consistent visibility across the UI, REST API,
+        and GraphQL API.
+        """
+        if user.is_superuser:
+            return self
+        if user.is_anonymous:
+            return self.filter(shared=True)
+        return self.filter(
+            Q(shared=True) | Q(user=user)
+        )

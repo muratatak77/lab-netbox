@@ -1,0 +1,105 @@
+import django_tables2 as tables
+from django.utils.html import conditional_escape
+from django.utils.safestring import mark_safe
+from django.utils.translation import gettext_lazy as _
+
+from core.constants import JOB_LOG_ENTRY_LEVELS
+from core.models import Job
+from core.tables.columns import BadgeColumn
+from netbox.tables import BaseTable, NetBoxTable, columns
+from utilities.string import humanize_duration
+
+
+class JobTable(NetBoxTable):
+    id = tables.Column(
+        verbose_name=_('ID'),
+        linkify=True
+    )
+    name = tables.Column(
+        verbose_name=_('Name'),
+        linkify=True
+    )
+    object_type = columns.ContentTypeColumn(
+        verbose_name=_('Type')
+    )
+    object = tables.Column(
+        verbose_name=_('Object'),
+        linkify=True,
+        orderable=False
+    )
+    status = columns.ChoiceFieldColumn(
+        verbose_name=_('Status'),
+    )
+    created = columns.DateTimeColumn(
+        verbose_name=_('Created'),
+    )
+    scheduled = columns.DateTimeColumn(
+        verbose_name=_('Scheduled'),
+    )
+    interval = columns.DurationColumn(
+        verbose_name=_('Interval'),
+    )
+    started = columns.DateTimeColumn(
+        verbose_name=_('Started'),
+    )
+    completed = columns.DateTimeColumn(
+        verbose_name=_('Completed'),
+    )
+    execution_time = tables.Column(
+        verbose_name=_('Execution Time'),
+    )
+    queue_name = tables.Column(
+        verbose_name=_('Queue'),
+    )
+    log_entries = tables.Column(
+        verbose_name=_('Log Entries'),
+    )
+    actions = columns.ActionsColumn(
+        actions=('delete',)
+    )
+
+    class Meta(NetBoxTable.Meta):
+        model = Job
+        fields = (
+            'pk', 'id', 'object_type', 'object', 'name', 'status', 'created', 'scheduled', 'interval', 'started',
+            'completed', 'execution_time', 'user', 'queue_name', 'log_entries', 'error', 'job_id',
+        )
+        default_columns = (
+            'pk', 'id', 'object_type', 'object', 'name', 'status', 'created', 'started', 'completed', 'execution_time',
+            'user',
+        )
+
+    def render_log_entries(self, value):
+        return len(value)
+
+    def render_execution_time(self, value):
+        return humanize_duration(value)
+
+    def value_execution_time(self, value):
+        # Export the recorded execution time as a raw number of seconds, rather than the humanized
+        # string, as an export is intended for analysis
+        return round(value.total_seconds(), 3)
+
+
+class JobLogEntryTable(BaseTable):
+    timestamp = columns.DateTimeColumn(
+        timespec='milliseconds',
+        verbose_name=_('Time'),
+    )
+    level = BadgeColumn(
+        badges=JOB_LOG_ENTRY_LEVELS,
+        verbose_name=_('Level'),
+    )
+    message = tables.Column(
+        verbose_name=_('Message'),
+    )
+
+    class Meta(BaseTable.Meta):
+        empty_text = _('No log entries')
+        fields = ('timestamp', 'level', 'message')
+
+    def render_message(self, record, value):
+        if record.get('level') == 'error' and '\n' in value:
+            value = conditional_escape(value)
+            return mark_safe(f'<pre class="p-0">{value}</pre>')
+        return value

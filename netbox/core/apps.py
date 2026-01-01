@@ -1,0 +1,66 @@
+from django.apps import AppConfig
+from django.conf import settings
+from django.core.cache import cache
+from django.db import models
+from django.db.migrations.operations import AlterModelOptions
+from django.utils.translation import gettext as _
+from PIL import Image
+
+from core.events import *
+from netbox.events import EVENT_TYPE_KIND_DANGER, EVENT_TYPE_KIND_SUCCESS, EVENT_TYPE_KIND_WARNING, EventType
+from utilities.migration import custom_deconstruct
+
+# Ignore verbose_name & verbose_name_plural Meta options when calculating model migrations
+AlterModelOptions.ALTER_OPTION_KEYS.remove('verbose_name')
+AlterModelOptions.ALTER_OPTION_KEYS.remove('verbose_name_plural')
+
+# Use our custom destructor to ignore certain attributes when calculating field migrations
+models.Field.deconstruct = custom_deconstruct
+
+# Cap the maximum size of an image Pillow will decode, to mitigate decompression-bomb DoS attacks. Pillow raises a
+# DecompressionBombError when an image's declared dimensions exceed 2x this value, before allocating pixel buffers.
+# Django's & DRF's ImageField already convert that exception into a validation error, so no additional handling is
+# required; this single assignment covers all image upload paths (UI forms, REST API, and direct model saves).
+Image.MAX_IMAGE_PIXELS = 25_000_000
+
+
+class CoreConfig(AppConfig):
+    name = "core"
+
+    def ready(self):
+        from core.api import schema  # noqa: F401
+        from core.checks import (  # noqa: F401
+            check_duplicate_indexes,
+            check_postgresql_version,
+            check_redis_version,
+        )
+        from netbox import context_managers  # noqa: F401
+        from netbox.models.features import register_models
+
+        # Importing netbox.search.jobs registers its system job(s) (e.g. the
+        # search-cache flush safety net) in registry['system_jobs'] before the
+        # RQ worker reads that registry at startup. The module is otherwise only
+        # imported lazily, so this import is load-bearing, not cosmetic.
+        from netbox.search import jobs as search_jobs  # noqa: F401
+        from netbox.search import signals as search_signals  # noqa: F401
+
+        from . import data_backends, events, search  # noqa: F401
+
+        # Register models
+        register_models(*self.get_models())
+
+        # Register core events
+        EventType(OBJECT_CREATED, _('Object created')).register()
+        EventType(OBJECT_UPDATED, _('Object updated')).register()
+        EventType(OBJECT_DELETED, _('Object deleted'), destructive=True).register()
+        EventType(JOB_STARTED, _('Job started')).register()
+        EventType(JOB_COMPLETED, _('Job completed'), kind=EVENT_TYPE_KIND_SUCCESS).register()
+        EventType(JOB_FAILED, _('Job failed'), kind=EVENT_TYPE_KIND_WARNING).register()
+        EventType(JOB_ERRORED, _('Job errored'), kind=EVENT_TYPE_KIND_DANGER).register()
+
+        # Clear Redis cache on startup in development mode
+        if settings.DEBUG:
+            try:
+                cache.clear()
+            except Exception:
+                pass

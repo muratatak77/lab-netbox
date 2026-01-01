@@ -1,0 +1,474 @@
+import logging
+import warnings
+from contextlib import contextmanager
+from functools import cached_property
+
+from django.core.exceptions import FieldError, ObjectDoesNotExist, PermissionDenied, ValidationError
+from django.db import router, transaction
+from django.db.models import ProtectedError, RestrictedError
+from rest_framework import mixins as drf_mixins
+from rest_framework import status
+from rest_framework.exceptions import MethodNotAllowed
+from rest_framework.permissions import SAFE_METHODS
+from rest_framework.response import Response
+from rest_framework.viewsets import GenericViewSet
+
+from netbox.api.fields import RelatedObjectCountField
+from netbox.api.serializers.features import ChangeLogMessageSerializer
+from utilities.api import get_annotations_for_serializer, get_fields_for_serializer, get_prefetches_for_serializer
+from utilities.exceptions import AbortRequest, PreconditionFailed
+from utilities.query import reapply_model_ordering
+
+from . import mixins
+
+__all__ = (
+    'MPTTLockedMixin',
+    'NetBoxModelViewSet',
+    'NetBoxReadOnlyModelViewSet',
+)
+
+HTTP_ACTIONS = {
+    'GET': 'view',
+    'OPTIONS': None,
+    'HEAD': 'view',
+    'POST': 'add',
+    'PUT': 'change',
+    'PATCH': 'change',
+    'DELETE': 'delete',
+}
+
+
+class ETagMixin:
+    """
+    Adds ETag header support to ViewSets. Generates weak ETags (W/ prefix per
+    RFC 7232 §2.1) from `last_updated` (or `created` if unavailable). Weak ETags
+    are appropriate here because the tag is derived from a modification timestamp
+    rather than a hash of the serialized payload.
+    """
+
+    @staticmethod
+    def _get_etag(obj):
+        """Return a weak ETag string for the given object, or None."""
+        if ts := getattr(obj, 'last_updated', None) or getattr(obj, 'created', None):
+            return f'W/"{ts.isoformat()}"'
+        return None
+
+    @staticmethod
+    def _get_if_match(request):
+        """Return the list of If-Match header values (if specified)."""
+        if (if_match := request.META.get('HTTP_IF_MATCH')) and if_match != '*':
+            return [e.strip() for e in if_match.split(',')]
+        return []
+
+    def _validate_etag(self, request, instance):
+        """Validate the request's ETag"""
+        if provided := self._get_if_match(request):
+            current_etag = self._get_etag(instance)
+            if current_etag and current_etag not in provided:
+                raise PreconditionFailed(etag=current_etag)
+
+    def handle_exception(self, exc):
+        response = super().handle_exception(exc)
+        if isinstance(exc, PreconditionFailed) and exc.etag:
+            response['ETag'] = exc.etag
+        return response
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+        response = Response(serializer.data)
+        if etag := self._get_etag(instance):
+            response['ETag'] = etag
+        return response
+
+
+class BaseViewSet(GenericViewSet):
+    """
+    Base class for all API ViewSets. This is responsible for the enforcement of object-based permissions.
+    """
+    brief = False
+    # Prefetches dynamic resolution cannot derive (method fields, model properties), keyed by the fields reading them
+    field_prefetches = {}
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+
+        # Reject any method for which no action has been declared, rather than proceeding against an
+        # unrestricted QuerySet. (A method mapped to None, e.g. OPTIONS, is permitted: it needs no
+        # restriction.) This is the same 405 DRF would return when resolving the handler for an unmapped
+        # method, but it also covers a handler bound to such a method (e.g. @action(methods=['trace'])).
+        if request.method not in HTTP_ACTIONS:
+            raise MethodNotAllowed(request.method)
+
+        # Restrict the view's QuerySet to allow only the permitted objects
+        if request.user.is_authenticated:
+            if action := HTTP_ACTIONS[request.method]:
+                self.queryset = self.queryset.restrict(request.user, action)
+
+    def initialize_request(self, request, *args, **kwargs):
+
+        # Annotate whether brief mode is active
+        self.brief = request.method == 'GET' and request.GET.get('brief')
+
+        return super().initialize_request(request, *args, **kwargs)
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        serializer_class = self.get_serializer_class()
+
+        # Declared lookups precede the dynamic ones, so a declared Prefetch queryset wins on a shared path
+        if prefetch := self.get_field_prefetches():
+            qs = qs.prefetch_related(*prefetch)
+
+        # Dynamically resolve prefetches for included serializer fields and attach them to the queryset
+        if prefetch := get_prefetches_for_serializer(serializer_class, **self.field_kwargs):
+            qs = qs.prefetch_related(*prefetch)
+
+        # Dynamically resolve annotations for RelatedObjectCountFields on the serializer and attach them to the queryset
+        exclude = self.fallback_count_fields if self.renders_whole_objects else ()
+        if annotations := get_annotations_for_serializer(serializer_class, **self.field_kwargs, exclude=exclude):
+            qs = qs.annotate(**annotations)
+
+        return qs
+
+    def get_field_prefetches(self, fields=None):
+        """Return the declared prefetches of given fields, by default the response's (all for exports and writes)."""
+        if not self.field_prefetches:
+            return []
+        if fields is None:
+            # Exports and writes render whole objects (templates, event payloads), so they load every declaration
+            if self.renders_whole_objects:
+                fields = set().union(*self.field_prefetches)
+            else:
+                # Reads annotate the counts with a fallback in place of their declarations
+                fields = self.response_fields - self.fallback_count_fields
+        return [
+            lookup
+            for field_names, lookups in self.field_prefetches.items()
+            if not fields.isdisjoint(field_names)
+            for lookup in lookups
+        ]
+
+    def get_serializer(self, *args, **kwargs):
+        # Pass the fields/omit kwargs (if specified by the request) to the serializer
+        kwargs.update(**self.field_kwargs)
+        return super().get_serializer(*args, **kwargs)
+
+    @cached_property
+    def field_kwargs(self):
+        """Return a dictionary of keyword arguments to be passed when instantiating the serializer."""
+        # An explicit list of fields was requested
+        if requested_fields := self.request.query_params.get('fields'):
+            return {'fields': requested_fields.split(',')}
+
+        # An explicit list of fields to omit was requested
+        if omit_fields := self.request.query_params.get('omit'):
+            return {'omit': omit_fields.split(',')}
+
+        # Brief mode has been enabled for this request
+        if self.brief:
+            serializer_class = self.get_serializer_class()
+            if brief_fields := getattr(serializer_class.Meta, 'brief_fields', None):
+                return {'fields': brief_fields}
+
+        return {}
+
+    @cached_property
+    def response_fields(self):
+        """Return the serializer field names rendered for this request, as selected by field_kwargs."""
+        return frozenset(get_fields_for_serializer(self.get_serializer_class(), **self.field_kwargs))
+
+    @cached_property
+    def renders_whole_objects(self):
+        """Return True for exports and writes, whatever fields the response selects."""
+        return 'export' in self.request.query_params or self.request.method not in SAFE_METHODS
+
+    @cached_property
+    def fallback_count_fields(self):
+        """Return the names of the count fields annotated for reads only."""
+        return frozenset(
+            name for name, field in self.get_serializer_class()._declared_fields.items()
+            if type(field) is RelatedObjectCountField and field.fallback_source
+        )
+
+
+class NetBoxReadOnlyModelViewSet(
+    ETagMixin,
+    mixins.CustomFieldsMixin,
+    mixins.ExportTemplatesMixin,
+    drf_mixins.RetrieveModelMixin,
+    drf_mixins.ListModelMixin,
+    BaseViewSet
+):
+    pass
+
+
+class NetBoxModelViewSet(
+    ETagMixin,
+    mixins.BackgroundOperationMixin,
+    mixins.BulkCreateModelMixin,
+    mixins.BulkUpdateModelMixin,
+    mixins.BulkDestroyModelMixin,
+    mixins.ObjectLockingMixin,
+    mixins.ObjectValidationMixin,
+    mixins.CustomFieldsMixin,
+    mixins.ExportTemplatesMixin,
+    drf_mixins.CreateModelMixin,
+    drf_mixins.RetrieveModelMixin,
+    drf_mixins.UpdateModelMixin,
+    drf_mixins.DestroyModelMixin,
+    drf_mixins.ListModelMixin,
+    BaseViewSet
+):
+    """
+    Extend DRF's ModelViewSet to support bulk update and delete functions.
+    """
+    def get_object_with_snapshot(self):
+        """
+        Save a pre-change snapshot of the object immediately after retrieving it. This snapshot will be used to
+        record the "before" data in the changelog.
+        """
+        obj = super().get_object()
+        if hasattr(obj, 'snapshot'):
+            obj.snapshot()
+        return obj
+
+    @contextmanager
+    def lock_object(self):
+        """
+        Lock the row of the requested object for the duration of the block (see lock_objects()). Enter this
+        immediately within a transaction, before retrieving the object.
+        """
+        manager = self.queryset.model._default_manager
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        try:
+            queryset = manager.filter(**{self.lookup_field: self.kwargs[lookup_url_kwarg]})
+        except (KeyError, FieldError, TypeError, ValueError, ValidationError):
+            # The URL has no lookup value, or the lookup is not valid for the model
+            queryset = manager.none()
+        with self.lock_objects(queryset):
+            yield
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        return reapply_model_ordering(qs)
+
+    def get_serializer(self, *args, **kwargs):
+        # If a list of objects has been provided, initialize the serializer with many=True
+        if isinstance(kwargs.get('data', {}), list):
+            kwargs['many'] = True
+
+        return super().get_serializer(*args, **kwargs)
+
+    def dispatch(self, request, *args, **kwargs):
+        logger = logging.getLogger(f'netbox.api.views.{self.__class__.__name__}')
+
+        try:
+            return super().dispatch(request, *args, **kwargs)
+        except (ProtectedError, RestrictedError) as e:
+            if type(e) is ProtectedError:
+                protected_objects = list(e.protected_objects)
+            else:
+                protected_objects = list(e.restricted_objects)
+            msg = f'Unable to delete object. {len(protected_objects)} dependent objects were found: '
+            msg += ', '.join([f'{obj} ({obj.pk})' for obj in protected_objects])
+            logger.warning(msg)
+            return self.finalize_response(
+                request,
+                Response({'detail': msg}, status=409),
+                *args,
+                **kwargs
+            )
+        except AbortRequest as e:
+            logger.debug(e.message)
+            return self.finalize_response(
+                request,
+                Response({'detail': e.message}, status=400),
+                *args,
+                **kwargs
+            )
+
+    def exception_to_response(self, exc):
+        """
+        Translate a NetBox/Django exception that is not a DRF APIException into the same
+        Response that dispatch() would return for it. Returns None if the exception is not
+        one this method handles (the caller should then re-raise or defer to DRF).
+
+        This mirrors the except clauses in dispatch(); it is also called by the background
+        job runner (netbox.jobs.AsyncAPIJob), which executes action methods directly and so
+        bypasses dispatch(). NOTE: dispatch() does not yet call this helper itself; the two
+        should be consolidated into a single source of truth in a future change.
+        """
+        logger = logging.getLogger(f'netbox.api.views.{self.__class__.__name__}')
+        if isinstance(exc, (ProtectedError, RestrictedError)):
+            if type(exc) is ProtectedError:
+                protected_objects = list(exc.protected_objects)
+            else:
+                protected_objects = list(exc.restricted_objects)
+            msg = f'Unable to delete object. {len(protected_objects)} dependent objects were found: '
+            msg += ', '.join([f'{obj} ({obj.pk})' for obj in protected_objects])
+            logger.warning(msg)
+            return Response({'detail': msg}, status=409)
+        if isinstance(exc, AbortRequest):
+            logger.debug(exc.message)
+            return Response({'detail': exc.message}, status=400)
+        return None
+
+    # Creates
+
+    def create(self, request, *args, **kwargs):
+        # If background processing was requested for a bulk (list) create, enqueue a job and
+        # return immediately. Single-object creates always run synchronously.
+        if (response := self._handle_background_request(request, 'create')) is not None:
+            return response
+
+        # Creating multiple objects, which are validated and saved one at a time in order to
+        # collect per-object errors (see BulkCreateModelMixin)
+        if isinstance(request.data, list):
+            return self.bulk_create(request, *args, **kwargs)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+
+        # After creating the instance, re-initialize the serializer with a queryset
+        # to ensure related objects are prefetched.
+        qs = self.get_queryset().get(pk=serializer.instance.pk)
+
+        # Re-serialize the instance with prefetched data
+        serializer = self.get_serializer(qs)
+
+        headers = self.get_success_headers(serializer.data)
+        response = Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+        if etag := self._get_etag(qs):
+            response['ETag'] = etag
+
+        return response
+
+    def perform_create(self, serializer):
+        model = self.queryset.model
+        logger = logging.getLogger(f'netbox.api.views.{self.__class__.__name__}')
+        logger.info(f"Creating new {model._meta.verbose_name}")
+
+        # Enforce object-level permissions on save()
+        using = router.db_for_write(model)
+        try:
+            with transaction.atomic(using=using), mixins.discard_events_on_rollback(self, using=using):
+                instance = serializer.save()
+                self._validate_objects(instance)
+        except ObjectDoesNotExist:
+            raise PermissionDenied()
+
+    # Updates
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+
+        # Lock the object before retrieving it, so that concurrent updates to the same object are applied one after
+        # the other. Otherwise, each would save its own copy of the object, reverting any fields which another
+        # update had changed since that copy was retrieved.
+        using = router.db_for_write(self.queryset.model)
+        with transaction.atomic(using=using), self.lock_object():
+            instance = self.get_object_with_snapshot()
+
+            # Enforce If-Match precondition (RFC 9110 §13.1.1)
+            self._validate_etag(self.request, instance)
+
+            serializer = self.get_serializer(instance, data=request.data, partial=partial)
+            serializer.is_valid(raise_exception=True)
+            self.perform_update(serializer)
+
+        # After updating the instance, re-initialize the serializer with a queryset
+        # to ensure related objects are prefetched.
+        qs = self.get_queryset().get(pk=serializer.instance.pk)
+
+        # Re-serialize the instance(s) with prefetched data
+        serializer = self.get_serializer(qs)
+        response = Response(serializer.data)
+
+        if etag := self._get_etag(qs):
+            response['ETag'] = etag
+
+        return response
+
+    def perform_update(self, serializer):
+        model = self.queryset.model
+        logger = logging.getLogger(f'netbox.api.views.{self.__class__.__name__}')
+        logger.info(f"Updating {model._meta.verbose_name} {serializer.instance} (PK: {serializer.instance.pk})")
+
+        # Enforce object-level permissions on save()
+        using = router.db_for_write(model)
+        try:
+            with transaction.atomic(using=using), mixins.discard_events_on_rollback(self, using=using):
+                # Check the If-Match ETag under a row-level lock to close the TOCTOU window between any
+                # earlier check and the actual write. An object retrieved only once its row had been
+                # locked is already current; otherwise, lock its row and re-fetch it.
+                if self._get_if_match(self.request):
+                    if serializer.instance.pk in self.locked_pks:
+                        current = serializer.instance
+                    else:
+                        current = model._default_manager.select_for_update().get(pk=serializer.instance.pk)
+                    self._validate_etag(self.request, current)
+                instance = serializer.save()
+                self._validate_objects(instance)
+        except ObjectDoesNotExist:
+            raise PermissionDenied()
+
+    # Deletes
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object_with_snapshot()
+
+        # Enforce If-Match precondition (RFC 9110 §13.1.1)
+        self._validate_etag(request, instance)
+
+        # Attach changelog message (if any)
+        serializer = ChangeLogMessageSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        instance._changelog_message = serializer.validated_data.get('changelog_message')
+
+        self.perform_destroy(instance)
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    def perform_destroy(self, instance):
+        model = self.queryset.model
+        logger = logging.getLogger(f'netbox.api.views.{self.__class__.__name__}')
+        logger.info(f"Deleting {model._meta.verbose_name} {instance} (PK: {instance.pk})")
+
+        using = router.db_for_write(model)
+        try:
+            with transaction.atomic(using=using), mixins.discard_events_on_rollback(self, using=using):
+                # Re-check the If-Match ETag under a row-level lock to close the TOCTOU window
+                # between the initial check in destroy() and the actual delete.
+                if self._get_if_match(self.request):
+                    locked = model.objects.select_for_update().get(pk=instance.pk)
+                    self._validate_etag(self.request, locked)
+                super().perform_destroy(instance)
+        except ObjectDoesNotExist:
+            raise PermissionDenied()
+
+
+# TODO: Remove this in NetBox v5.0
+class MPTTLockedMixin:
+    """
+    Deprecated no-op mixin retained for backward compatibility.
+
+    Historically this acquired a pglock around create/update/destroy to serialize
+    concurrent writes to MPTT-based tree models. NetBox no longer uses MPTT: tree
+    integrity is now maintained by the PostgreSQL ltree triggers (see
+    `utilities.ltree`), which take per-tree advisory locks at the database level.
+    This mixin is therefore now a transparent pass-through and may be removed in a
+    future release. Plugins should stop inheriting from it.
+    """
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        warnings.warn(
+            "MPTTLockedMixin is deprecated and no longer does anything; tree write "
+            "concurrency is now handled by ltree database triggers. Remove it from "
+            f"{cls.__name__}.",
+            DeprecationWarning,
+            stacklevel=2,
+        )

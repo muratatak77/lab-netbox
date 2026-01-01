@@ -1,0 +1,28 @@
+from django.core.management.base import BaseCommand
+
+from ipam.models import VRF, Prefix
+from ipam.utils import rebuild_prefixes
+from utilities.querysets import chunked_update
+
+
+class Command(BaseCommand):
+    help = "Rebuild the prefix hierarchy (depth and children counts)"
+
+    def handle(self, *model_names, **options):
+        self.stdout.write(f'Rebuilding {Prefix.objects.count()} prefixes...')
+
+        # Reset existing counts
+        chunked_update(Prefix.objects.all(), _depth=0, _children=0)
+
+        # Rebuild the global table
+        global_count = Prefix.objects.filter(vrf__isnull=True).count()
+        self.stdout.write(f'Global: {global_count} prefixes...')
+        rebuild_prefixes(None)
+
+        # Rebuild each VRF
+        for vrf in VRF.objects.all():
+            vrf_count = Prefix.objects.filter(vrf=vrf).count()
+            self.stdout.write(f'VRF {vrf}: {vrf_count} prefixes...')
+            rebuild_prefixes(vrf.pk)
+
+        self.stdout.write(self.style.SUCCESS('Finished.'))

@@ -1,0 +1,1908 @@
+import datetime
+import hashlib
+import io
+import logging
+import uuid
+from unittest.mock import PropertyMock, patch
+
+from django.contrib.contenttypes.models import ContentType
+from django.contrib.messages import get_messages
+from django.test import tag
+from django.urls import reverse
+from django.utils.html import escape
+from django.utils.timezone import now
+
+from core.choices import JobStatusChoices, ManagedFileRootPathChoices
+from core.events import *
+from core.models import DataFile, DataSource, Job, ObjectType
+from dcim.models import DeviceType, Manufacturer, Site
+from extras.choices import *
+from extras.models import *
+from extras.scripts import BooleanVar, IntegerVar, MultiChoiceVar, StringVar
+from extras.scripts import Script as PythonClass
+from netbox.choices import CSVDelimiterChoices, ImportFormatChoices
+from users.models import Group, ObjectPermission, User
+from utilities.testing import TestCase, ViewTestCases
+
+
+class CustomFieldTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = CustomField
+
+    @classmethod
+    def setUpTestData(cls):
+
+        site_type = ObjectType.objects.get_for_model(Site)
+        CustomFieldChoiceSet.objects.create(
+            name='Choice Set 1',
+            extra_choices=(
+                ('A', 'A'),
+                ('B', 'B'),
+                ('C', 'C'),
+            )
+        )
+
+        custom_fields = (
+            CustomField(name='field1', label='Field 1', type=CustomFieldTypeChoices.TYPE_TEXT),
+            CustomField(name='field2', label='Field 2', type=CustomFieldTypeChoices.TYPE_TEXT),
+            CustomField(name='field3', label='Field 3', type=CustomFieldTypeChoices.TYPE_TEXT),
+        )
+        for customfield in custom_fields:
+            customfield.save()
+            customfield.object_types.add(site_type)
+
+        cls.form_data = {
+            'name': 'field_x',
+            'label': 'Field X',
+            'type': 'text',
+            'object_types': [site_type.pk],
+            'search_weight': 2000,
+            'filter_logic': CustomFieldFilterLogicChoices.FILTER_EXACT,
+            'default': None,
+            'weight': 200,
+            'required': True,
+            'ui_visible': CustomFieldUIVisibleChoices.ALWAYS,
+            'ui_editable': CustomFieldUIEditableChoices.YES,
+        }
+
+        cls.csv_data = (
+            'name,label,type,object_types,related_object_type,weight,search_weight,filter_logic,choice_set,validation_minimum,validation_maximum,validation_regex,ui_visible,ui_editable',
+            'field4,Field 4,text,dcim.site,,100,1000,exact,,,,[a-z]{3},always,yes',
+            'field5,Field 5,integer,dcim.site,,100,2000,exact,,1,100,,always,yes',
+            'field6,Field 6,select,dcim.site,,100,3000,exact,Choice Set 1,,,,always,yes',
+            'field7,Field 7,object,dcim.site,dcim.region,100,4000,exact,,,,,always,yes',
+        )
+
+        cls.csv_update_data = (
+            'id,label',
+            f'{custom_fields[0].pk},New label 1',
+            f'{custom_fields[1].pk},New label 2',
+            f'{custom_fields[2].pk},New label 3',
+        )
+
+        cls.bulk_edit_data = {
+            'required': True,
+            'weight': 200,
+        }
+
+
+class CustomFieldChoiceSetTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = CustomFieldChoiceSet
+
+    @classmethod
+    def setUpTestData(cls):
+
+        choice_sets = (
+            CustomFieldChoiceSet(
+                name='Choice Set 1',
+                extra_choices=(('A1', 'Choice 1'), ('A2', 'Choice 2'), ('A3', 'Choice 3'))
+            ),
+            CustomFieldChoiceSet(
+                name='Choice Set 2',
+                extra_choices=(('B1', 'Choice 1'), ('B2', 'Choice 2'), ('B3', 'Choice 3'))
+            ),
+            CustomFieldChoiceSet(
+                name='Choice Set 3',
+                extra_choices=(('C1', 'Choice 1'), ('C2', 'Choice 2'), ('C3', 'Choice 3'))
+            ),
+            CustomFieldChoiceSet(
+                name='Choice Set 4',
+                extra_choices=(('D1', 'Choice 1'), ('D2', 'Choice 2'), ('D3', 'Choice 3'))
+            ),
+        )
+        CustomFieldChoiceSet.objects.bulk_create(choice_sets)
+
+        cls.form_data = {
+            'name': 'Choice Set X',
+            'extra_choices': '\n'.join(['X1:Choice 1', 'X2:Choice 2', 'X3:Choice 3'])
+        }
+
+        cls.csv_data = (
+            'name,extra_choices',
+            'Choice Set 5,"D1,D2,D3"',
+            'Choice Set 6,"E1,E2,E3"',
+            'Choice Set 7,"F1,F2,F3"',
+            'Choice Set 8,"F1:L1,F2:L2,F3:L3"',
+        )
+
+        cls.csv_update_data = (
+            'id,extra_choices',
+            f'{choice_sets[0].pk},"A,B,C"',
+            f'{choice_sets[1].pk},"A,B,C"',
+            f'{choice_sets[2].pk},"A,B,C"',
+            f'{choice_sets[3].pk},"A:L1,B:L2,C:L3"',
+        )
+
+        cls.bulk_edit_data = {
+            'description': 'New description',
+        }
+
+    # This is here as extra_choices field splits on colon, but is returned
+    # from DB as comma separated.
+    def assertInstanceEqual(self, instance, data, exclude=None, api=False):
+        if 'extra_choices' in data:
+            data['extra_choices'] = data['extra_choices'].replace(':', ',')
+        return super().assertInstanceEqual(instance, data, exclude, api)
+
+
+class CustomLinkTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = CustomLink
+
+    @classmethod
+    def setUpTestData(cls):
+        site_type = ObjectType.objects.get_for_model(Site)
+        custom_links = (
+            CustomLink(name='Custom Link 1', enabled=True, link_text='Link 1', link_url='http://example.com/?1'),
+            CustomLink(name='Custom Link 2', enabled=True, link_text='Link 2', link_url='http://example.com/?2'),
+            CustomLink(name='Custom Link 3', enabled=False, link_text='Link 3', link_url='http://example.com/?3'),
+        )
+        CustomLink.objects.bulk_create(custom_links)
+        for i, custom_link in enumerate(custom_links):
+            custom_link.object_types.set([site_type])
+
+        cls.form_data = {
+            'name': 'Custom Link X',
+            'object_types': [site_type.pk],
+            'enabled': False,
+            'weight': 100,
+            'button_class': CustomLinkButtonClassChoices.DEFAULT,
+            'link_text': 'Link X',
+            'link_url': 'http://example.com/?x'
+        }
+
+        cls.csv_data = (
+            "name,object_types,enabled,weight,button_class,link_text,link_url",
+            "Custom Link 4,dcim.site,True,100,blue,Link 4,http://exmaple.com/?4",
+            "Custom Link 5,dcim.site,True,100,blue,Link 5,http://exmaple.com/?5",
+            "Custom Link 6,dcim.site,False,100,blue,Link 6,http://exmaple.com/?6",
+        )
+
+        cls.csv_update_data = (
+            "id,name",
+            f"{custom_links[0].pk},Custom Link 7",
+            f"{custom_links[1].pk},Custom Link 8",
+            f"{custom_links[2].pk},Custom Link 9",
+        )
+
+        cls.bulk_edit_data = {
+            'button_class': CustomLinkButtonClassChoices.CYAN,
+            'enabled': False,
+            'weight': 200,
+        }
+
+
+class CustomLinkRenderingTestCase(TestCase):
+    user_permissions = ['dcim.view_site', 'extras.view_customlink']
+
+    def test_view_object_with_custom_link(self):
+        customlink = CustomLink(
+            name='Test',
+            link_text='FOO {{ object.name }} BAR',
+            link_url='http://example.com/?site={{ object.slug }}',
+            new_window=False
+        )
+        customlink.save()
+        customlink.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+        site = Site(name='Test Site', slug='test-site')
+        site.save()
+
+        response = self.client.get(site.get_absolute_url(), follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(f'FOO {site.name} BAR', str(response.content))
+
+    def test_list_view_custom_link_column(self):
+        # A custom link column must render in the list view when the user can view the CustomLink.
+        customlink = CustomLink(
+            name='Test',
+            link_text='FOO {{ object.name }} BAR',
+            link_url='http://example.com/?site={{ object.slug }}',
+            new_window=False
+        )
+        customlink.save()
+        customlink.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+        site = Site(name='Test Site', slug='test-site')
+        site.save()
+
+        # Custom link columns are hidden by default; explicitly include the column
+        response = self.client.get(f"{reverse('dcim:site_list')}?include_columns=cl_Test")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(f'FOO {site.name} BAR', str(response.content))
+
+    def test_list_view_custom_link_column_hidden_without_permission(self):
+        # A custom link column must be excluded from the list view when the user cannot view the
+        # CustomLink, even if explicitly requested (#22439).
+        customlink = CustomLink(
+            name='Test',
+            link_text='FOO {{ object.name }} BAR',
+            link_url='http://example.com/?site={{ object.slug }}',
+            new_window=False
+        )
+        customlink.save()
+        customlink.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+        site = Site(name='Test Site', slug='test-site')
+        site.save()
+
+        # Revoke permission to view custom links
+        self.remove_permissions('extras.view_customlink')
+
+        response = self.client.get(f"{reverse('dcim:site_list')}?include_columns=cl_Test")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(f'FOO {site.name} BAR', str(response.content))
+
+    def test_list_view_custom_link_column_escapes_render_error(self):
+        # Jinja2 includes the invalid key verbatim in UndefinedError; this test intentionally depends on that format.
+        payload = '" ></span><script>alert(1)</script>'
+        customlink = CustomLink(
+            name='Test',
+            link_text=f"{{{{ ''['{payload}'] + 1 }}}}",
+            link_url='http://example.com/',
+            new_window=False
+        )
+        customlink.save()
+        customlink.object_types.set([ObjectType.objects.get_for_model(Site)])
+
+        site = Site(name='Test Site', slug='test-site')
+        site.save()
+
+        response = self.client.get(f"{reverse('dcim:site_list')}?include_columns=cl_Test")
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+
+        # The error element must be present, but the payload must appear only in escaped form
+        self.assertIn('<span class="text-danger" title="', content)
+        self.assertNotIn(payload, content)
+        self.assertIn(escape(payload), content)
+
+
+class SavedFilterTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = SavedFilter
+
+    @classmethod
+    def setUpTestData(cls):
+        site_type = ObjectType.objects.get_for_model(Site)
+
+        users = (
+            User(username='User 1'),
+            User(username='User 2'),
+            User(username='User 3'),
+        )
+        User.objects.bulk_create(users)
+
+        saved_filters = (
+            SavedFilter(
+                name='Saved Filter 1',
+                slug='saved-filter-1',
+                user=users[0],
+                weight=100,
+                parameters={'status': ['active']}
+            ),
+            SavedFilter(
+                name='Saved Filter 2',
+                slug='saved-filter-2',
+                user=users[1],
+                weight=200,
+                parameters={'status': ['planned']}
+            ),
+            SavedFilter(
+                name='Saved Filter 3',
+                slug='saved-filter-3',
+                user=users[2],
+                weight=300,
+                parameters={'status': ['retired']}
+            ),
+        )
+        SavedFilter.objects.bulk_create(saved_filters)
+        for i, savedfilter in enumerate(saved_filters):
+            savedfilter.object_types.set([site_type])
+
+        cls.form_data = {
+            'name': 'Saved Filter X',
+            'slug': 'saved-filter-x',
+            'object_types': [site_type.pk],
+            'description': 'Foo',
+            'weight': 1000,
+            'enabled': True,
+            'shared': True,
+            'parameters': '{"foo": 123}',
+        }
+
+        cls.csv_data = (
+            'name,slug,object_types,weight,enabled,shared,parameters',
+            'Saved Filter 4,saved-filter-4,dcim.device,400,True,True,{"foo": "a"}',
+            'Saved Filter 5,saved-filter-5,dcim.device,500,True,True,{"foo": "b"}',
+            'Saved Filter 6,saved-filter-6,dcim.device,600,True,True,{"foo": "c"}',
+        )
+
+        cls.csv_update_data = (
+            "id,name",
+            f"{saved_filters[0].pk},Saved Filter 7",
+            f"{saved_filters[1].pk},Saved Filter 8",
+            f"{saved_filters[2].pk},Saved Filter 9",
+        )
+
+        cls.bulk_edit_data = {
+            'weight': 999,
+        }
+
+
+class TableConfigTestCase(
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.GetObjectChangelogViewTestCase,
+    ViewTestCases.CreateObjectViewTestCase,
+    ViewTestCases.EditObjectViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkEditObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase,
+):
+    model = TableConfig
+    # Selected columns are POSTed as a list but compared as a CSV string
+    validation_excluded_fields = ('columns',)
+
+    @classmethod
+    def setUpTestData(cls):
+        site_type = ObjectType.objects.get_for_model(Site)
+        users = (
+            User(username='User 1'),
+            User(username='User 2'),
+            User(username='User 3'),
+        )
+        User.objects.bulk_create(users)
+
+        table_configs = (
+            TableConfig(
+                name='Table Config 1',
+                object_type=site_type,
+                table='SiteTable',
+                user=users[0],
+                columns=['name', 'status'],
+            ),
+            TableConfig(
+                name='Table Config 2',
+                object_type=site_type,
+                table='SiteTable',
+                user=users[1],
+                columns=['name', 'region'],
+            ),
+            TableConfig(
+                name='Table Config 3',
+                object_type=site_type,
+                table='SiteTable',
+                user=users[2],
+                columns=['name', 'tenant'],
+            ),
+        )
+        TableConfig.objects.bulk_create(table_configs)
+
+        cls.form_data = {
+            'name': 'Table Config X',
+            'object_type': site_type.pk,
+            'table': 'SiteTable',
+            'description': 'A table config',
+            'weight': 100,
+            'enabled': True,
+            'shared': True,
+            'columns': ['name', 'status'],
+            'ordering': 'name',
+        }
+        cls.bulk_edit_data = {
+            'weight': 999,
+        }
+
+    def _get_url(self, action, instance=None):
+        url = super()._get_url(action, instance)
+        # The add view requires the table context from the source table view
+        if action == 'add':
+            site_type = ObjectType.objects.get_for_model(Site)
+            url = f'{url}?object_type={site_type.pk}&table=SiteTable'
+        return url
+
+    def test_add_view_without_table_context(self):
+        """A GET without the table context params must redirect to the home page."""
+        self.add_permissions('extras.add_tableconfig')
+        response = self.client.get(reverse('extras:tableconfig_add'))
+        self.assertRedirects(response, reverse('home'))
+
+        messages_list = list(get_messages(response.wsgi_request))
+        self.assertEqual(len(messages_list), 1)
+        self.assertEqual(str(messages_list[0]), 'Table configurations must be created from an object list view.')
+
+    def test_add_view_post_without_table_context(self):
+        """A POST without the table context must return form errors rather than a server error."""
+        self.add_permissions('extras.add_tableconfig')
+        response = self.client.post(reverse('extras:tableconfig_add'), data={})
+        self.assertHttpStatus(response, 200)
+
+
+class BookmarkTestCase(
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase
+):
+    model = Bookmark
+
+    @classmethod
+    def setUpTestData(cls):
+        site_ct = ContentType.objects.get_for_model(Site)
+        sites = (
+            Site(name='Site 1', slug='site-1'),
+            Site(name='Site 2', slug='site-2'),
+            Site(name='Site 3', slug='site-3'),
+            Site(name='Site 4', slug='site-4'),
+        )
+        Site.objects.bulk_create(sites)
+
+        cls.form_data = {
+            'object_type': site_ct.pk,
+            'object_id': sites[3].pk,
+        }
+
+    def setUp(self):
+        super().setUp()
+
+        sites = Site.objects.all()
+        user = self.user
+
+        bookmarks = (
+            Bookmark(object=sites[0], user=user),
+            Bookmark(object=sites[1], user=user),
+            Bookmark(object=sites[2], user=user),
+        )
+        Bookmark.objects.bulk_create(bookmarks)
+
+    def _get_url(self, action, instance=None):
+        if action == 'list':
+            return reverse('account:bookmarks')
+        return super()._get_url(action, instance)
+
+    def test_list_objects_anonymous(self):
+        return
+
+    def test_export_objects_anonymous(self):
+        return
+
+    def test_list_objects_with_constrained_permission(self):
+        return
+
+
+class ImageAttachmentTestCase(
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase,
+):
+    # Add/Edit/BulkEdit are omitted: ImageField.save() re-reads the file to
+    # populate image_height / image_width, which fails when fixtures use
+    # placeholder URLs instead of real images on disk.
+    model = ImageAttachment
+
+    def setUp(self):
+        super().setUp()
+        # The fixtures use placeholder image URLs with no file on disk, so rendering the thumbnail
+        # column logs a FileNotFoundError traceback for every attachment. The missing files are
+        # expected here, so mute the sorl-thumbnail logger to keep the test output clean.
+        logger = logging.getLogger('sorl.thumbnail')
+        original_level = logger.level
+        logger.setLevel(logging.CRITICAL)
+        self.addCleanup(logger.setLevel, original_level)
+
+    @classmethod
+    def setUpTestData(cls):
+        ct = ContentType.objects.get_for_model(Site)
+        site = Site.objects.create(name='Site 1', slug='site-1')
+
+        ImageAttachment.objects.bulk_create(
+            [
+                ImageAttachment(
+                    object_type=ct,
+                    object_id=site.pk,
+                    name='Image Attachment 1',
+                    image='http://example.com/image1.png',
+                    image_height=100,
+                    image_width=100,
+                    image_size=1024,
+                ),
+                ImageAttachment(
+                    object_type=ct,
+                    object_id=site.pk,
+                    name='Image Attachment 2',
+                    image='http://example.com/image2.png',
+                    image_height=100,
+                    image_width=100,
+                    image_size=2048,
+                ),
+                ImageAttachment(
+                    object_type=ct,
+                    object_id=site.pk,
+                    name='Image Attachment 3',
+                    image='http://example.com/image3.png',
+                    image_height=100,
+                    image_width=100,
+                    image_size=4096,
+                ),
+            ]
+        )
+
+    @tag('regression')
+    def test_add_form_submission_guard(self):
+        """The add form opts into the duplicate submission guard."""
+        self.add_permissions('extras.add_imageattachment')
+        site = Site.objects.get(slug='site-1')
+
+        response = self.client.get(reverse('extras:imageattachment_add'), {
+            'object_type': ContentType.objects.get_for_model(Site).pk,
+            'object_id': site.pk,
+        })
+
+        self.assertHttpStatus(response, 200)
+        self.assertIn(
+            '<form action="" method="post" enctype="multipart/form-data" '
+            'class="object-edit object-edit--with-sticky-actions mt-5" data-disable-on-submit>',
+            response.content.decode(),
+        )
+
+
+class ExportTemplateTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = ExportTemplate
+
+    @classmethod
+    def setUpTestData(cls):
+        site_type = ObjectType.objects.get_for_model(Site)
+        TEMPLATE_CODE = """{% for object in queryset %}{{ object }}{% endfor %}"""
+        ENVIRONMENT_PARAMS = """{"trim_blocks": true}"""
+
+        export_templates = (
+            ExportTemplate(name='Export Template 1', template_code=TEMPLATE_CODE),
+            ExportTemplate(
+                name='Export Template 2', template_code=TEMPLATE_CODE, environment_params={"trim_blocks": True}
+            ),
+            ExportTemplate(name='Export Template 3', template_code=TEMPLATE_CODE, file_name='export_template_3')
+        )
+        ExportTemplate.objects.bulk_create(export_templates)
+        for et in export_templates:
+            et.object_types.set([site_type])
+
+        datasource = DataSource.objects.create(
+            name='Data Source 1',
+            type='local',
+            source_url='file:///tmp/netbox-datasource/',
+        )
+        cls.file_data = b'{% for object in queryset %}{{ object.name }}{% endfor %}'
+        cls.datafile = DataFile.objects.create(
+            source=datasource,
+            path='exports/sites.j2',
+            last_updated=now(),
+            size=len(cls.file_data),
+            hash=hashlib.sha256(cls.file_data).hexdigest(),
+            data=cls.file_data,
+        )
+
+        # The same path in two sources, so a path alone cannot identify the file
+        other_datasource = DataSource.objects.create(
+            name='Data Source 2',
+            type='local',
+            source_url='file:///tmp/netbox-datasource-2/',
+        )
+        cls.shared_path = 'exports/shared.j2'
+        cls.shared_datafile = DataFile.objects.create(
+            source=datasource,
+            path=cls.shared_path,
+            last_updated=now(),
+            size=len(cls.file_data),
+            hash=hashlib.sha256(cls.file_data).hexdigest(),
+            data=cls.file_data,
+        )
+        DataFile.objects.create(
+            source=other_datasource,
+            path=cls.shared_path,
+            last_updated=now(),
+            size=len(cls.file_data),
+            hash=hashlib.sha256(cls.file_data).hexdigest(),
+            data=cls.file_data,
+        )
+
+        cls.form_data = {
+            'name': 'Export Template X',
+            'object_types': [site_type.pk],
+            'template_code': TEMPLATE_CODE,
+            'environment_params': ENVIRONMENT_PARAMS,
+            'file_name': 'template_x',
+        }
+
+        cls.csv_data = {
+            'default': (
+                "name,object_types,template_code,file_name",
+                f"Export Template 4,dcim.site,{TEMPLATE_CODE},",
+                f"Export Template 5,dcim.site,{TEMPLATE_CODE},template_5",
+                f"Export Template 6,dcim.site,{TEMPLATE_CODE},",
+            ),
+            'with_data_file': (
+                "name,object_types,data_file,auto_sync_enabled",
+                f"Export Template 10,dcim.site,{cls.datafile.path},true",
+            ),
+            'with_duplicate_path': (
+                "name,object_types,data_source,data_file",
+                f"Export Template 12,dcim.site,{datasource.name},{cls.shared_path}",
+            ),
+        }
+
+        cls.csv_update_data = (
+            "id,name",
+            f"{export_templates[0].pk},Export Template 7",
+            f"{export_templates[1].pk},Export Template 8",
+            f"{export_templates[2].pk},Export Template 9",
+        )
+
+        cls.bulk_edit_data = {
+            'mime_type': 'text/html',
+            'file_extension': 'html',
+            'as_attachment': True,
+        }
+
+    def test_bulk_import_objects_with_permission(self):
+        def verify_data_file(scenario_name):
+            if scenario_name != 'with_data_file':
+                return
+            export_template = ExportTemplate.objects.get(name='Export Template 10')
+            self.assertEqual(export_template.data_file, self.datafile)
+            self.assertEqual(export_template.data_source, self.datafile.source)
+            self.assertEqual(export_template.data_path, self.datafile.path)
+            self.assertEqual(export_template.template_code, self.file_data.decode('utf-8'))
+            self.assertTrue(export_template.auto_sync_enabled)
+
+        def verify_duplicate_path(scenario_name):
+            if scenario_name != 'with_duplicate_path':
+                return
+            export_template = ExportTemplate.objects.get(name='Export Template 12')
+            self.assertEqual(export_template.data_file, self.shared_datafile)
+
+        def verify(scenario_name):
+            verify_data_file(scenario_name)
+            verify_duplicate_path(scenario_name)
+
+        super().test_bulk_import_objects_with_permission(post_import_callback=verify)
+
+    def test_bulk_import_without_content_or_data_file(self):
+        """A row supplying neither template code nor a data file is rejected."""
+        self.add_permissions('extras.add_exporttemplate')
+        initial_count = ExportTemplate.objects.count()
+
+        response = self.client.post(self._get_url('bulk_import'), {
+            'data': "name,object_types\nExport Template 11,dcim.site",
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertHttpStatus(response, 200)
+        self.assertEqual(ExportTemplate.objects.count(), initial_count)
+
+    def test_bulk_import_with_source_id_column(self):
+        """A data_source.id column scopes the file lookup, and a malformed id is a row error."""
+        self.add_permissions('core.view_datafile', 'core.view_datasource', 'extras.add_exporttemplate')
+        source_id = self.shared_datafile.source_id
+
+        for label, value, expected_status in (
+            ('valid', str(source_id), 302),
+            ('malformed', 'not-a-number', 200),
+        ):
+            with self.subTest(source_id=label):
+                response = self.client.post(self._get_url('bulk_import'), {
+                    'data': f"name,object_types,data_source.id,data_file\n"
+                            f"Export Template {label},dcim.site,{value},{self.shared_path}",
+                    'format': ImportFormatChoices.CSV,
+                    'csv_delimiter': CSVDelimiterChoices.AUTO,
+                })
+                self.assertHttpStatus(response, expected_status)
+
+        export_template = ExportTemplate.objects.get(name='Export Template valid')
+        self.assertEqual(export_template.data_file, self.shared_datafile)
+        self.assertFalse(ExportTemplate.objects.filter(name='Export Template malformed').exists())
+
+    def test_bulk_import_update_with_source_but_no_file_column(self):
+        """An update record naming a source but no file does not trip the scoped file lookup."""
+        self.add_permissions(
+            'core.view_datafile',
+            'core.view_datasource',
+            'extras.add_exporttemplate',
+            'extras.change_exporttemplate',
+        )
+        export_template = ExportTemplate.objects.get(name='Export Template 1')
+
+        response = self.client.post(self._get_url('bulk_import'), {
+            'data': f"id,data_source\n{export_template.pk},{self.datafile.source.name}",
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertHttpStatus(response, 302)
+
+    def test_bulk_import_update_cannot_blank_template_code(self):
+        """An update row clearing template code on a template with no data file is rejected."""
+        self.add_permissions('extras.add_exporttemplate', 'extras.change_exporttemplate')
+        export_template = ExportTemplate.objects.get(name='Export Template 1')
+
+        response = self.client.post(self._get_url('bulk_import'), {
+            'data': f"id,template_code\n{export_template.pk},",
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertHttpStatus(response, 200)
+
+        export_template.refresh_from_db()
+        self.assertNotEqual(export_template.template_code, '')
+
+    def test_content_is_not_cacheable(self):
+        """
+        The detail view renders the template code inline, which may have been synced from a data
+        file containing sensitive values, so the response must not be cached by the browser.
+        """
+        export_template = ExportTemplate.objects.first()
+        export_template.template_code = 'super-secret-password'
+        export_template.save()
+
+        self.add_permissions('extras.view_exporttemplate')
+        response = self.client.get(export_template.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+
+        # Confirm the template code is in fact rendered in the response
+        self.assertIn(b'super-secret-password', response.content)
+
+        self.assertNotCacheable(response)
+
+
+class ExportTemplateExportFlowTestCase(TestCase):
+    """
+    End-to-end test for ExportTemplate invocation via a list view's ?export=<name> query param.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        Site.objects.bulk_create([
+            Site(name='Site A', slug='site-a'),
+            Site(name='Site B', slug='site-b'),
+        ])
+
+        site_type = ObjectType.objects.get_for_model(Site)
+
+        ok_template = ExportTemplate.objects.create(
+            name='Sites Export',
+            template_code='{% for obj in queryset %}{{ obj.name }}\n{% endfor %}',
+            mime_type='text/plain',
+            file_extension='txt',
+        )
+        ok_template.object_types.set([site_type])
+
+        broken_template = ExportTemplate.objects.create(
+            name='Broken Export',
+            template_code='{% for obj in queryset %}{{ obj.name ',  # unterminated expression
+        )
+        broken_template.object_types.set([site_type])
+
+    def test_export_template_invocation(self):
+        self.add_permissions('dcim.view_site', 'extras.view_exporttemplate')
+        url = reverse('dcim:site_list')
+
+        response = self.client.get(f'{url}?export=Sites Export')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'text/plain')
+        self.assertEqual(response['Content-Disposition'], 'attachment; filename="netbox_sites.txt"')
+        # The rendered queryset reflects whatever ordering the list view applies. Assert on set
+        # membership rather than line order so the test isn't coupled to Site's natural ordering.
+        rendered_names = set(filter(None, response.content.decode().split('\n')))
+        self.assertEqual(rendered_names, {'Site A', 'Site B'})
+
+    def test_export_template_render_error_redirects(self):
+        self.add_permissions('dcim.view_site', 'extras.view_exporttemplate')
+        url = reverse('dcim:site_list')
+
+        # A broken template surfaces an exception during render; the view catches it and redirects
+        # back to the (filtered) list view rather than returning a 500.
+        response = self.client.get(f'{url}?export=Broken Export')
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response['Location'].startswith(url))
+        self.assertNotIn('export=', response['Location'])
+
+
+class WebhookTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = Webhook
+
+    @classmethod
+    def setUpTestData(cls):
+
+        webhooks = (
+            Webhook(name='Webhook 1', payload_url='http://example.com/?1', http_method='POST'),
+            Webhook(name='Webhook 2', payload_url='http://example.com/?2', http_method='POST'),
+            Webhook(name='Webhook 3', payload_url='http://example.com/?3', http_method='POST'),
+        )
+        for webhook in webhooks:
+            webhook.save()
+
+        cls.form_data = {
+            'name': 'Webhook X',
+            'payload_url': 'http://example.com/?x',
+            'http_method': 'GET',
+            'http_content_type': 'application/foo',
+            'timeout': 45,
+            'description': 'My webhook',
+        }
+
+        cls.csv_data = (
+            "name,payload_url,http_method,http_content_type,timeout,description",
+            "Webhook 4,http://example.com/?4,GET,application/json,15,Foo",
+            "Webhook 5,http://example.com/?5,GET,application/json,,Bar",
+            "Webhook 6,http://example.com/?6,GET,application/json,,Baz",
+        )
+
+        cls.csv_update_data = (
+            "id,name,description",
+            f"{webhooks[0].pk},Webhook 7,Foo",
+            f"{webhooks[1].pk},Webhook 8,Bar",
+            f"{webhooks[2].pk},Webhook 9,Baz",
+        )
+
+        cls.bulk_edit_data = {
+            'http_method': 'GET',
+            'timeout': 60,
+        }
+
+
+class EventRulesTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = EventRule
+
+    @classmethod
+    def setUpTestData(cls):
+
+        webhooks = (
+            Webhook(name='Webhook 1', payload_url='http://example.com/?1', http_method='POST'),
+            Webhook(name='Webhook 2', payload_url='http://example.com/?2', http_method='POST'),
+            Webhook(name='Webhook 3', payload_url='http://example.com/?3', http_method='POST'),
+        )
+        for webhook in webhooks:
+            webhook.save()
+
+        site_type = ObjectType.objects.get_for_model(Site)
+        event_rules = (
+            EventRule(name='EventRule 1', event_types=[OBJECT_CREATED], action_object=webhooks[0]),
+            EventRule(name='EventRule 2', event_types=[OBJECT_CREATED], action_object=webhooks[1]),
+            EventRule(name='EventRule 3', event_types=[OBJECT_CREATED], action_object=webhooks[2]),
+        )
+        for event in event_rules:
+            event.save()
+            event.object_types.add(site_type)
+
+        webhook_ct = ContentType.objects.get_for_model(Webhook)
+        cls.form_data = {
+            'name': 'Event X',
+            'object_types': [site_type.pk],
+            'event_types': [OBJECT_UPDATED, OBJECT_DELETED],
+            'conditions': None,
+            'action_type': 'webhook',
+            'action_object_type': webhook_ct.pk,
+            'action_object_id': webhooks[0].pk,
+            'action_choice': webhooks[0],
+            'description': 'New description',
+        }
+
+        cls.csv_data = (
+            'name,object_types,event_types,action_type,action_object',
+            f'Webhook 4,dcim.site,"{OBJECT_CREATED},{OBJECT_UPDATED}",webhook,Webhook 1',
+        )
+
+        cls.csv_update_data = (
+            "id,name",
+            f"{event_rules[0].pk},Event 7",
+            f"{event_rules[1].pk},Event 8",
+            f"{event_rules[2].pk},Event 9",
+        )
+
+        cls.bulk_edit_data = {
+            'description': 'New description',
+        }
+
+
+class TagTestCase(ViewTestCases.OrganizationalObjectViewTestCase):
+    model = Tag
+
+    @classmethod
+    def setUpTestData(cls):
+
+        site_ct = ContentType.objects.get_for_model(Site)
+
+        tags = (
+            Tag(name='Tag 1', slug='tag-1'),
+            Tag(name='Tag 2', slug='tag-2', weight=1),
+            Tag(name='Tag 3', slug='tag-3', weight=32767),
+        )
+        Tag.objects.bulk_create(tags)
+
+        cls.form_data = {
+            'name': 'Tag X',
+            'slug': 'tag-x',
+            'color': 'c0c0c0',
+            'comments': 'Some comments',
+            'object_types': [site_ct.pk],
+            'weight': 11,
+        }
+
+        cls.csv_data = (
+            "name,slug,color,description,object_types,weight",
+            "Tag 4,tag-4,ff0000,Fourth tag,dcim.interface,0",
+            "Tag 5,tag-5,00ff00,Fifth tag,'dcim.device,dcim.site',1111",
+            "Tag 6,tag-6,0000ff,Sixth tag,dcim.site,0",
+        )
+
+        cls.csv_update_data = (
+            "id,name,description",
+            f"{tags[0].pk},Tag 7,Fourth tag7",
+            f"{tags[1].pk},Tag 8,Fifth tag8",
+            f"{tags[2].pk},Tag 9,Sixth tag9",
+        )
+
+        cls.bulk_edit_data = {
+            'color': '00ff00',
+        }
+
+
+class ConfigContextProfileTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = ConfigContextProfile
+
+    @classmethod
+    def setUpTestData(cls):
+        profiles = (
+            ConfigContextProfile(
+                name='Config Context Profile 1',
+                schema={
+                    "properties": {
+                        "foo": {
+                            "type": "string"
+                        }
+                    },
+                    "required": [
+                        "foo"
+                    ]
+                }
+            ),
+            ConfigContextProfile(
+                name='Config Context Profile 2',
+                schema={
+                    "properties": {
+                        "bar": {
+                            "type": "string"
+                        }
+                    },
+                    "required": [
+                        "bar"
+                    ]
+                }
+            ),
+            ConfigContextProfile(
+                name='Config Context Profile 3',
+                schema={
+                    "properties": {
+                        "baz": {
+                            "type": "string"
+                        }
+                    },
+                    "required": [
+                        "baz"
+                    ]
+                }
+            ),
+        )
+        ConfigContextProfile.objects.bulk_create(profiles)
+
+        cls.form_data = {
+            'name': 'Config Context Profile X',
+            'description': 'A new config context profile',
+        }
+
+        cls.bulk_edit_data = {
+            'description': 'New description',
+        }
+
+        cls.csv_data = (
+            'name,description',
+            'Config context profile 1,Foo',
+            'Config context profile 2,Bar',
+            'Config context profile 3,Baz',
+        )
+
+        cls.csv_update_data = (
+            "id,description",
+            f"{profiles[0].pk},New description",
+            f"{profiles[1].pk},New description",
+            f"{profiles[2].pk},New description",
+        )
+
+    def test_content_is_not_cacheable(self):
+        """
+        The detail view renders the schema inline, which may have been synced from a data file
+        containing sensitive values, so the response must not be cached by the browser.
+        """
+        instance = ConfigContextProfile.objects.first()
+        instance.schema = {
+            'properties': {
+                'password': {
+                    'type': 'string',
+                    'default': 'super-secret-password',
+                }
+            }
+        }
+        instance.save()
+
+        self.add_permissions('extras.view_configcontextprofile')
+        response = self.client.get(instance.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+
+        # Confirm the schema is in fact rendered in the response
+        self.assertIn(b'super-secret-password', response.content)
+
+        self.assertNotCacheable(response)
+
+
+# TODO: Change base class to PrimaryObjectViewTestCase
+# Blocked by absence of standard create/edit, bulk create views
+class ConfigContextTestCase(
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.GetObjectChangelogViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkEditObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase
+):
+    model = ConfigContext
+
+    @classmethod
+    def setUpTestData(cls):
+
+        manufacturer = Manufacturer.objects.create(name='Manufacturer 1', slug='manufacturer-1')
+        devicetype = DeviceType.objects.create(manufacturer=manufacturer, model='Device Type 1', slug='device-type-1')
+
+        # Create three ConfigContexts
+        for i in range(1, 4):
+            configcontext = ConfigContext(
+                name='Config Context {}'.format(i),
+                data={'foo': i}
+            )
+            configcontext.save()
+            configcontext.device_types.add(devicetype)
+
+        cls.form_data = {
+            'name': 'Config Context X',
+            'weight': 200,
+            'description': 'A new config context',
+            'is_active': True,
+            'regions': [],
+            'sites': [],
+            'roles': [],
+            'platforms': [],
+            'tenant_groups': [],
+            'tenants': [],
+            'device_types': [devicetype.id],
+            'tags': [],
+            'data': '{"foo": 123}',
+        }
+
+        cls.bulk_edit_data = {
+            'weight': 300,
+            'is_active': False,
+            'description': 'New description',
+        }
+
+    def test_content_is_not_cacheable(self):
+        """
+        The detail view renders the data inline, which may have been synced from a data
+        file containing sensitive values, so the response must not be cached by the browser.
+        """
+        instance = ConfigContext.objects.first()
+        instance.data = {'password': 'super-secret-password'}
+        instance.save()
+
+        self.add_permissions('extras.view_configcontext')
+        response = self.client.get(instance.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+
+        # Confirm the context data is in fact rendered in the response
+        self.assertIn(b'super-secret-password', response.content)
+
+        self.assertNotCacheable(response)
+
+
+class ConfigTemplateTestCase(
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.GetObjectChangelogViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkEditObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase
+):
+    model = ConfigTemplate
+
+    @classmethod
+    def setUpTestData(cls):
+        TEMPLATE_CODE = """Foo: {{ foo }}"""
+        ENVIRONMENT_PARAMS = """{"trim_blocks": true}"""
+
+        config_templates = (
+            ConfigTemplate(
+                name='Config Template 1',
+                template_code=TEMPLATE_CODE)
+            ,
+            ConfigTemplate(
+                name='Config Template 2',
+                template_code=TEMPLATE_CODE,
+                environment_params={"trim_blocks": True},
+            ),
+            ConfigTemplate(
+                name='Config Template 3',
+                template_code=TEMPLATE_CODE,
+                file_name='config_template_3',
+            ),
+        )
+        ConfigTemplate.objects.bulk_create(config_templates)
+
+        cls.form_data = {
+            'name': 'Config Template X',
+            'description': 'Config template',
+            'template_code': TEMPLATE_CODE,
+            'environment_params': ENVIRONMENT_PARAMS,
+            'file_name': 'config_x',
+        }
+
+        cls.csv_update_data = (
+            "id,name",
+            f"{config_templates[0].pk},Config Template 7",
+            f"{config_templates[1].pk},Config Template 8",
+            f"{config_templates[2].pk},Config Template 9",
+        )
+
+        cls.bulk_edit_data = {
+            'description': 'New description',
+            'mime_type': 'text/html',
+            'file_name': 'output',
+            'file_extension': 'html',
+            'as_attachment': True,
+        }
+
+    def test_content_is_not_cacheable(self):
+        """
+        The detail view renders the template code inline, which may have been synced from a data
+        file containing sensitive values, so the response must not be cached by the browser.
+        """
+        instance = ConfigTemplate.objects.first()
+        instance.template_code = 'super-secret-password'
+        instance.save()
+
+        self.add_permissions('extras.view_configtemplate')
+        response = self.client.get(instance.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+
+        # Confirm the template code is in fact rendered in the response
+        self.assertIn(b'super-secret-password', response.content)
+
+        self.assertNotCacheable(response)
+
+
+class JournalEntryTestCase(
+    # ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.CreateObjectViewTestCase,
+    ViewTestCases.EditObjectViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkEditObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase
+):
+    model = JournalEntry
+
+    @classmethod
+    def setUpTestData(cls):
+        site_ct = ContentType.objects.get_for_model(Site)
+
+        site = Site.objects.create(name='Site 1', slug='site-1')
+        user = User.objects.create(username='User 1')
+
+        JournalEntry.objects.bulk_create((
+            JournalEntry(assigned_object=site, created_by=user, comments='First entry'),
+            JournalEntry(assigned_object=site, created_by=user, comments='Second entry'),
+            JournalEntry(assigned_object=site, created_by=user, comments='Third entry'),
+        ))
+
+        cls.form_data = {
+            'assigned_object_type': site_ct.pk,
+            'assigned_object_id': site.pk,
+            'kind': 'info',
+            'comments': 'A new entry',
+        }
+
+        cls.bulk_edit_data = {
+            'kind': 'success',
+            'comments': 'Overwritten',
+        }
+
+
+class SubscriptionTestCase(
+    ViewTestCases.CreateObjectViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase
+):
+    model = Subscription
+
+    @classmethod
+    def setUpTestData(cls):
+        site_ct = ContentType.objects.get_for_model(Site)
+        sites = (
+            Site(name='Site 1', slug='site-1'),
+            Site(name='Site 2', slug='site-2'),
+            Site(name='Site 3', slug='site-3'),
+            Site(name='Site 4', slug='site-4'),
+        )
+        Site.objects.bulk_create(sites)
+
+        cls.form_data = {
+            'object_type': site_ct.pk,
+            'object_id': sites[3].pk,
+        }
+
+    def setUp(self):
+        super().setUp()
+
+        sites = Site.objects.all()
+        user = self.user
+
+        subscriptions = (
+            Subscription(object=sites[0], user=user),
+            Subscription(object=sites[1], user=user),
+            Subscription(object=sites[2], user=user),
+        )
+        Subscription.objects.bulk_create(subscriptions)
+
+    def _get_url(self, action, instance=None):
+        if action == 'list':
+            return reverse('account:subscriptions')
+        return super()._get_url(action, instance)
+
+    def test_list_objects_anonymous(self):
+        self.client.logout()
+        url = reverse('account:subscriptions')
+        login_url = reverse('login')
+        self.assertRedirects(self.client.get(url), f'{login_url}?next={url}')
+
+    def test_export_objects_anonymous(self):
+        return
+
+    def test_list_objects_with_permission(self):
+        return
+
+    def test_list_objects_with_constrained_permission(self):
+        return
+
+
+class NotificationGroupTestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = NotificationGroup
+
+    @classmethod
+    def setUpTestData(cls):
+        users = (
+            User(username='User 1'),
+            User(username='User 2'),
+            User(username='User 3'),
+        )
+        User.objects.bulk_create(users)
+        groups = (
+            Group(name='Group 1'),
+            Group(name='Group 2'),
+            Group(name='Group 3'),
+        )
+        Group.objects.bulk_create(groups)
+
+        notification_groups = (
+            NotificationGroup(name='Notification Group 1'),
+            NotificationGroup(name='Notification Group 2'),
+            NotificationGroup(name='Notification Group 3'),
+        )
+        NotificationGroup.objects.bulk_create(notification_groups)
+        for i, notification_group in enumerate(notification_groups):
+            notification_group.users.add(users[i])
+            notification_group.groups.add(groups[i])
+
+        cls.form_data = {
+            'name': 'Notification Group X',
+            'description': 'Blah',
+            'users': [users[0].pk, users[1].pk],
+            'groups': [groups[0].pk, groups[1].pk],
+        }
+
+        cls.csv_data = (
+            'name,description,users,groups',
+            'Notification Group 4,Foo,"User 1,User 2","Group 1,Group 2"',
+            'Notification Group 5,Bar,"User 1,User 2","Group 1,Group 2"',
+            'Notification Group 6,Baz,"User 1,User 2","Group 1,Group 2"',
+        )
+
+        cls.csv_update_data = (
+            "id,name",
+            f"{notification_groups[0].pk},Notification Group 7",
+            f"{notification_groups[1].pk},Notification Group 8",
+            f"{notification_groups[2].pk},Notification Group 9",
+        )
+
+        cls.bulk_edit_data = {
+            'description': 'New description',
+        }
+
+
+class NotificationTestCase(
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase
+):
+    model = Notification
+
+    @classmethod
+    def setUpTestData(cls):
+        site_ct = ContentType.objects.get_for_model(Site)
+        sites = (
+            Site(name='Site 1', slug='site-1'),
+            Site(name='Site 2', slug='site-2'),
+            Site(name='Site 3', slug='site-3'),
+            Site(name='Site 4', slug='site-4'),
+        )
+        Site.objects.bulk_create(sites)
+
+        cls.form_data = {
+            'object_type': site_ct.pk,
+            'object_id': sites[3].pk,
+        }
+
+    def setUp(self):
+        super().setUp()
+
+        sites = Site.objects.all()
+        user = self.user
+
+        notifications = (
+            Notification(object=sites[0], user=user),
+            Notification(object=sites[1], user=user),
+            Notification(object=sites[2], user=user),
+        )
+        Notification.objects.bulk_create(notifications)
+
+    def _get_url(self, action, instance=None):
+        if action == 'list':
+            return reverse('account:notifications')
+        return super()._get_url(action, instance)
+
+    def test_list_objects_anonymous(self):
+        self.client.logout()
+        url = reverse('account:notifications')
+        login_url = reverse('login')
+        self.assertRedirects(self.client.get(url), f'{login_url}?next={url}')
+
+    def test_export_objects_anonymous(self):
+        return
+
+    def test_list_objects_with_permission(self):
+        return
+
+    def test_list_objects_with_constrained_permission(self):
+        return
+
+
+class ScriptListViewTestCase(TestCase):
+    user_permissions = ['extras.view_script']
+
+    def test_script_list_embedded_parameter(self):
+        """Test that ScriptListView accepts embedded parameter without error"""
+        url = reverse('extras:script_list')
+
+        # Test normal request
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, 'extras/script_list.html')
+
+        # Test embedded request
+        response = self.client.get(url, {'embedded': 'true'})
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, 'extras/inc/script_list_content.html')
+
+
+class ScriptModuleCreateViewTestCase(TestCase):
+    user_permissions = ['core.add_managedfile', 'extras.add_scriptmodule']
+
+    @tag('regression')
+    def test_default_return_url(self):
+        """
+        The add view should fall back to the scripts list as its return URL.
+        """
+        response = self.client.get(reverse('extras:scriptmodule_add'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context['return_url'], reverse('extras:script_list'))
+
+
+class ScriptDefaultBackfillTestCase(TestCase):
+    """
+    The UI and the REST API now share prepare_script_form(), so the UI's back-filling of
+    declared defaults (previously inline in ScriptView.post()) must keep working after
+    that logic moved into the helper.
+    """
+    user_permissions = ['extras.view_script', 'extras.run_script']
+
+    class TestScriptClass(PythonClass):
+        class Meta:
+            name = 'Backfill test'
+            commit_default = False
+
+        label = StringVar(default='hello')
+        flag = BooleanVar(default=True)
+        picks = MultiChoiceVar(choices=(('a', 'A'), ('b', 'B'), ('c', 'C')), default=['a', 'b'])
+
+        def run(self, data, commit):
+            return 'Complete'
+
+    @classmethod
+    def setUpTestData(cls):
+        with patch.object(ScriptModule, 'sync_classes'):
+            module = ScriptModule.objects.create(
+                file_root=ManagedFileRootPathChoices.SCRIPTS,
+                file_path='backfill_script.py',
+            )
+        cls.script = Script.objects.create(module=module, name='Backfill test', is_executable=True)
+
+    def setUp(self):
+        super().setUp()
+        python_class_patch = patch.object(Script, 'python_class', new=self.TestScriptClass)
+        python_class_patch.start()
+        self.addCleanup(python_class_patch.stop)
+
+    @tag('regression')
+    def test_ui_backfills_declared_defaults(self):
+        url = reverse('extras:script', kwargs={'pk': self.script.pk})
+
+        with (
+            patch('extras.views.any_workers_for_queue', return_value=True),
+            patch('extras.jobs.ScriptJob.enqueue') as mock_enqueue,
+        ):
+            mock_enqueue.return_value.pk = 1
+            response = self.client.post(url, {'_commit': 'true'})
+
+        self.assertEqual(response.status_code, 302)
+        data = mock_enqueue.call_args.kwargs['data']
+        self.assertEqual(data['label'], 'hello')
+        self.assertIs(data['flag'], True)
+        # A multi-value default must be set on the QueryDict with setlist(): a plain
+        # assignment stores the list as one nested value, which the multi-select widget
+        # then rejects as a single invalid choice.
+        self.assertEqual(data['picks'], ['a', 'b'])
+
+
+class ScriptValidationErrorTestCase(TestCase):
+    user_permissions = ['extras.view_script', 'extras.run_script']
+
+    class TestScriptMixin:
+        bar = IntegerVar(min_value=0, max_value=30)
+
+    class TestScriptClass(TestScriptMixin, PythonClass):
+        class Meta:
+            name = 'Test script'
+            commit_default = False
+            fieldsets = (("Logging", ("debug_mode",)),)
+
+        debug_mode = BooleanVar(default=False)
+
+        def run(self, data, commit):
+            return "Complete"
+
+    @classmethod
+    def setUpTestData(cls):
+        # Avoid trying to import a non-existent on-disk module during setup.
+        # This test creates the Script row explicitly and monkey-patches
+        # Script.python_class below.
+        with patch.object(ScriptModule, 'sync_classes'):
+            module = ScriptModule.objects.create(
+                file_root=ManagedFileRootPathChoices.SCRIPTS,
+                file_path='test_script.py',
+            )
+        cls.script = Script.objects.create(module=module, name='Test script', is_executable=True)
+
+    def setUp(self):
+        super().setUp()
+        python_class_patch = patch.object(Script, 'python_class', new=self.TestScriptClass)
+        python_class_patch.start()
+        self.addCleanup(python_class_patch.stop)
+
+    @tag('regression')
+    def test_script_validation_error_displays_message(self):
+        url = reverse('extras:script', kwargs={'pk': self.script.pk})
+
+        with patch('extras.views.any_workers_for_queue', return_value=True):
+            response = self.client.post(url, {'debug_mode': 'true', '_commit': 'true'})
+
+        self.assertEqual(response.status_code, 200)
+        messages = list(response.context['messages'])
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(str(messages[0]), "bar: This field is required.")
+
+    @tag('regression')
+    def test_script_validation_error_no_toast_for_fieldset_fields(self):
+        class FieldsetScript(PythonClass):
+            class Meta:
+                name = 'Fieldset test'
+                commit_default = False
+                fieldsets = (("Fields", ("required_field",)),)
+
+            required_field = IntegerVar(min_value=10)
+
+            def run(self, data, commit):
+                return "Complete"
+
+        url = reverse('extras:script', kwargs={'pk': self.script.pk})
+
+        with patch.object(Script, 'python_class', new_callable=PropertyMock) as mock_python_class:
+            mock_python_class.return_value = FieldsetScript
+            with patch('extras.views.any_workers_for_queue', return_value=True):
+                response = self.client.post(url, {'required_field': '5', '_commit': 'true'})
+
+        self.assertEqual(response.status_code, 200)
+        messages = list(response.context['messages'])
+        self.assertEqual(len(messages), 0)
+
+
+class ScriptMetaValidationViewTestCase(TestCase):
+    """
+    A script whose Meta declares an invalid job_timeout or notifications_default must surface an actionable error on
+    the run view rather than returning an HTTP 500 (#22872).
+    """
+    user_permissions = ['extras.view_script', 'extras.run_script']
+
+    class BadTimeoutScript(PythonClass):
+        class Meta:
+            name = 'Bad Timeout'
+            job_timeout = 'not-a-timeout'
+
+        def run(self, data, commit):
+            return "Complete"
+
+    class BadNotificationsScript(PythonClass):
+        class Meta:
+            name = 'Bad Notifications'
+            notifications_default = 'on_error'
+
+        def run(self, data, commit):
+            return "Complete"
+
+    @classmethod
+    def setUpTestData(cls):
+        with patch.object(ScriptModule, 'sync_classes'):
+            module = ScriptModule.objects.create(
+                file_root=ManagedFileRootPathChoices.SCRIPTS,
+                file_path='bad_meta.py',
+            )
+        cls.script = Script.objects.create(module=module, name='Bad meta', is_executable=True)
+
+    def _run_and_assert(self, python_class):
+        url = reverse('extras:script', kwargs={'pk': self.script.pk})
+        with patch.object(Script, 'python_class', new_callable=PropertyMock) as mock_python_class:
+            mock_python_class.return_value = python_class
+            with patch('extras.views.any_workers_for_queue', return_value=True):
+                with self.captureOnCommitCallbacks(execute=True):
+                    # Quick-run style: omit _notifications
+                    response = self.client.post(url, {'_commit': 'true'})
+
+        # Re-render with an error message, not a 500, and no Job enqueued
+        self.assertEqual(response.status_code, 200)
+        messages = list(response.context['messages'])
+        self.assertEqual(len(messages), 1)
+        self.assertIn('Unable to run script', str(messages[0]))
+        self.assertEqual(Job.objects.count(), 0)
+
+    @tag('regression')
+    def test_invalid_job_timeout_shows_error(self):
+        self._run_and_assert(self.BadTimeoutScript)
+
+    @tag('regression')
+    def test_invalid_notifications_default_shows_error(self):
+        self._run_and_assert(self.BadNotificationsScript)
+
+
+class ScriptDefaultValuesTestCase(TestCase):
+    user_permissions = ['extras.view_script', 'extras.run_script']
+
+    class TestScriptClass(PythonClass):
+        class Meta:
+            name = 'Test script'
+            commit_default = False
+
+        bool_default_true = BooleanVar(default=True)
+        bool_default_false = BooleanVar(default=False)
+        int_with_default = IntegerVar(default=0)
+        int_without_default = IntegerVar(required=False)
+
+        def run(self, data, commit):
+            return "Complete"
+
+    @classmethod
+    def setUpTestData(cls):
+        # Avoid trying to import a non-existent on-disk module during setup.
+        # This test creates the Script row explicitly and monkey-patches
+        # Script.python_class below.
+        with patch.object(ScriptModule, 'sync_classes'):
+            module = ScriptModule.objects.create(
+                file_root=ManagedFileRootPathChoices.SCRIPTS,
+                file_path='test_script.py',
+            )
+        cls.script = Script.objects.create(module=module, name='Test script', is_executable=True)
+
+    def setUp(self):
+        super().setUp()
+        python_class_patch = patch.object(Script, 'python_class', new=self.TestScriptClass)
+        python_class_patch.start()
+        self.addCleanup(python_class_patch.stop)
+
+    def test_default_values_are_used(self):
+        url = reverse('extras:script', kwargs={'pk': self.script.pk})
+
+        with patch('extras.views.any_workers_for_queue', return_value=True):
+            with patch('extras.jobs.ScriptJob.enqueue') as mock_enqueue:
+                mock_enqueue.return_value.pk = 1
+                self.client.post(url, {})
+                call_kwargs = mock_enqueue.call_args.kwargs
+                self.assertEqual(call_kwargs['data']['bool_default_true'], True)
+                self.assertEqual(call_kwargs['data']['bool_default_false'], False)
+                self.assertEqual(call_kwargs['data']['int_with_default'], 0)
+                self.assertIsNone(call_kwargs['data']['int_without_default'])
+
+
+class ScriptResultViewTestCase(TestCase):
+    SECRET_OUTPUT = 'my secret script output'
+
+    @classmethod
+    def setUpTestData(cls):
+        with patch.object(ScriptModule, 'sync_classes'):
+            module = ScriptModule.objects.create(
+                file_root=ManagedFileRootPathChoices.SCRIPTS,
+                file_path='test_script.py',
+            )
+        cls.allowed_script = Script.objects.create(
+            module=module, name='Allowed script', is_executable=True
+        )
+        cls.secret_script = Script.objects.create(
+            module=module, name='Secret script', is_executable=True
+        )
+
+        script_type = ObjectType.objects.get_for_model(Script)
+        cls.allowed_job = Job.objects.create(
+            object_type=script_type,
+            object_id=cls.allowed_script.pk,
+            name='allowed-job',
+            job_id=uuid.uuid4(),
+            status=JobStatusChoices.STATUS_COMPLETED,
+            data={'log': [], 'output': 'benign output'},
+        )
+        cls.secret_job = Job.objects.create(
+            object_type=script_type,
+            object_id=cls.secret_script.pk,
+            name='secret-job',
+            job_id=uuid.uuid4(),
+            status=JobStatusChoices.STATUS_COMPLETED,
+            data={'log': [], 'output': cls.SECRET_OUTPUT},
+        )
+
+    def test_get_without_view_job_permission_returns_404(self):
+        """
+        A user with extras.view_script but no core.view_job must not retrieve any job result
+        via ScriptResultView, even for the script whose object-level permission they hold.
+        """
+        self.add_permissions('extras.view_script')
+
+        url = reverse('extras:script_result', kwargs={'job_pk': self.allowed_job.pk})
+        self.assertHttpStatus(self.client.get(url), 404)
+
+        url = reverse('extras:script_result', kwargs={'job_pk': self.secret_job.pk})
+        self.assertHttpStatus(self.client.get(url), 404)
+
+    def test_get_export_output_without_view_job_permission_returns_404(self):
+        """
+        Regression for the PoC: the ?export=output path must not leak job.data['output']
+        when the user lacks core.view_job.
+        """
+        self.add_permissions('extras.view_script')
+
+        url = reverse('extras:script_result', kwargs={'job_pk': self.secret_job.pk})
+        response = self.client.get(url, {'export': 'output'})
+
+        self.assertHttpStatus(response, 404)
+        self.assertNotIn(self.SECRET_OUTPUT.encode(), response.content)
+
+    def test_get_with_constrained_view_job_permission(self):
+        """
+        With core.view_job constrained to the allowed job only, the user can fetch the allowed
+        result but the secret result is hidden (404).
+        """
+        self.add_permissions('extras.view_script')
+        obj_perm = ObjectPermission(
+            name='View allowed job only',
+            constraints={'pk': self.allowed_job.pk},
+            actions=['view'],
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Job))
+
+        url = reverse('extras:script_result', kwargs={'job_pk': self.allowed_job.pk})
+        self.assertHttpStatus(self.client.get(url), 200)
+
+        url = reverse('extras:script_result', kwargs={'job_pk': self.secret_job.pk})
+        response = self.client.get(url, {'export': 'output'})
+        self.assertHttpStatus(response, 404)
+        self.assertNotIn(self.SECRET_OUTPUT.encode(), response.content)
+
+
+class ScriptJobsRestrictionTestCase(TestCase):
+    """
+    Script views must display only the Jobs which the user is permitted to view.
+    """
+    # ScriptModule is a proxy model, so viewing it is governed by its concrete model's permission
+    user_permissions = ('extras.view_script', 'core.view_managedfile')
+
+    class TestScriptClass(PythonClass):
+        class Meta:
+            name = 'Restriction test'
+
+        def run(self, data, commit):
+            return 'Complete'
+
+    @classmethod
+    def setUpTestData(cls):
+        with patch.object(ScriptModule, 'sync_classes'):
+            module = ScriptModule.objects.create(
+                file_root=ManagedFileRootPathChoices.SCRIPTS,
+                file_path='restriction_script.py',
+            )
+        cls.script = Script.objects.create(module=module, name='Restriction test', is_executable=True)
+        cls.other_user = User.objects.create_user(username='otheruser')
+
+        # The other user's Job is the most recent, so that the script list must skip it (rather than
+        # hide it) to find the most recent Job the user is permitted to view
+        cls.system_job = cls._create_job('system-job', user=None, minutes_ago=30)
+        cls.other_job = cls._create_job('other-job', user=cls.other_user, minutes_ago=10)
+
+    @classmethod
+    def _create_job(cls, name, user, minutes_ago):
+        started = now() - datetime.timedelta(minutes=minutes_ago)
+        return Job.objects.create(
+            name=name,
+            object_type=ObjectType.objects.get_for_model(Script),
+            object_id=cls.script.pk,
+            status=JobStatusChoices.STATUS_COMPLETED,
+            job_id=uuid.uuid4(),
+            user=user,
+            started=started,
+            completed=started,
+        )
+
+    def setUp(self):
+        super().setUp()
+        python_class_patch = patch.object(Script, 'python_class', new=self.TestScriptClass)
+        python_class_patch.start()
+        self.addCleanup(python_class_patch.stop)
+        self.own_job = self._create_job('own-job', user=self.user, minutes_ago=20)
+
+    def _grant_view_job(self, constraints=None):
+        obj_perm = ObjectPermission(name='View jobs', constraints=constraints, actions=['view'])
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Job))
+
+    def _assert_script_views_show(self, expected_jobs):
+        """
+        Assert that the script's Jobs table and job count reflect only the expected Jobs.
+        """
+        response = self.client.get(reverse('extras:script_jobs', kwargs={'pk': self.script.pk}))
+        self.assertHttpStatus(response, 200)
+        self.assertEqual({row.record for row in response.context['table'].rows}, expected_jobs)
+        self.assertEqual(response.context['job_count'], len(expected_jobs))
+
+        for view_name in ('extras:script', 'extras:script_source'):
+            response = self.client.get(reverse(view_name, kwargs={'pk': self.script.pk}))
+            self.assertHttpStatus(response, 200)
+            self.assertEqual(response.context['job_count'], len(expected_jobs))
+
+    def _assert_script_list_shows(self, expected_job):
+        """
+        Assert that the script list displays the expected Job (or none) as the script's most recent result.
+        """
+        response = self.client.get(reverse('extras:script_list'))
+        self.assertHttpStatus(response, 200)
+        content = response.content.decode()
+        for job in (self.own_job, self.other_job, self.system_job):
+            result_url = reverse('extras:script_result', kwargs={'job_pk': job.pk})
+            if job == expected_job:
+                self.assertIn(result_url, content)
+            else:
+                self.assertNotIn(result_url, content)
+
+    def test_unconstrained_permission(self):
+        self._grant_view_job()
+        self._assert_script_views_show({self.own_job, self.other_job, self.system_job})
+        self._assert_script_list_shows(self.other_job)
+
+    def test_user_constrained_permission(self):
+        self._grant_view_job(constraints={'user': '$user'})
+        self._assert_script_views_show({self.own_job})
+        self._assert_script_list_shows(self.own_job)
+
+    def test_without_view_job_permission(self):
+        self._assert_script_views_show(set())
+        self._assert_script_list_shows(None)
+
+
+class ScriptSourceViewTestCase(TestCase):
+    """
+    The Source tab must show the script's actual location in the scripts storage backend,
+    not a path derived from the current working directory (#23511).
+    """
+    user_permissions = ['extras.view_script']
+
+    SCRIPT_CONTENT = (
+        "from extras.scripts import Script\n\n\n"
+        "class TestScript(Script):\n    pass\n"
+    )
+
+    @classmethod
+    def setUpTestData(cls):
+        with patch.object(ScriptModule, 'sync_classes'):
+            cls.module = ScriptModule.objects.create(
+                file_root=ManagedFileRootPathChoices.SCRIPTS,
+                file_path='test_script.py',
+            )
+        cls.script = Script.objects.create(module=cls.module, name='TestScript', is_executable=True)
+
+    def setUp(self):
+        super().setUp()
+        content = self.SCRIPT_CONTENT.encode()
+
+        class _Storage:
+            def open(self, name, mode='rb'):
+                if 'b' in mode:
+                    return io.BytesIO(content)
+                return io.StringIO(content.decode())
+
+        self._module_storage_patch = patch('extras.models.mixins.storages')
+        self._script_storage_patch = patch('extras.scripts.storages')
+        module_storage = self._module_storage_patch.start()
+        script_storage = self._script_storage_patch.start()
+        module_storage.__getitem__.return_value = _Storage()
+        script_storage.backends = {'scripts': {}}
+        script_storage.create_storage.return_value = _Storage()
+        self.addCleanup(self._script_storage_patch.stop)
+        self.addCleanup(self._module_storage_patch.stop)
+
+    def test_source_view_shows_storage_location(self):
+        url = reverse('extras:script_source', kwargs={'pk': self.script.pk})
+        response = self.client.get(url)
+
+        self.assertHttpStatus(response, 200)
+        self.assertContains(response, self.module.full_path)
+        self.assertContains(response, 'class TestScript(Script):')

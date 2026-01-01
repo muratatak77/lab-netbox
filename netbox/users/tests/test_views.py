@@ -1,0 +1,690 @@
+from django.urls import reverse
+
+from core.models import ObjectType
+from dcim.models import Site
+from netbox.choices import CSVDelimiterChoices, ImportFormatChoices
+from users.constants import TOKEN_PREFIX
+from users.models import *
+from utilities.testing import TestCase, ViewTestCases, create_test_user
+
+
+class UserTestCase(
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.CreateObjectViewTestCase,
+    ViewTestCases.EditObjectViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkImportObjectsViewTestCase,
+    ViewTestCases.BulkEditObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase,
+):
+    model = User
+    maxDiff = None
+    validation_excluded_fields = ['password']
+
+    def _get_queryset(self):
+        # Omit the user attached to the test client
+        return self.model.objects.exclude(username='testuser')
+
+    @classmethod
+    def setUpTestData(cls):
+        users = (
+            User(
+                username='username1', first_name='first1', last_name='last1', email='user1@foo.com', password='pass1xxx'
+            ),
+            User(
+                username='username2', first_name='first2', last_name='last2', email='user2@foo.com', password='pass2xxx'
+            ),
+            User(
+                username='username3', first_name='first3', last_name='last3', email='user3@foo.com', password='pass3xxx'
+            ),
+        )
+        User.objects.bulk_create(users)
+
+        cls.form_data = {
+            'username': 'usernamex',
+            'first_name': 'firstx',
+            'last_name': 'lastx',
+            'email': 'userx@foo.com',
+            'password': 'pass1xxxABCD',
+            'confirm_password': 'pass1xxxABCD',
+        }
+
+        cls.csv_data = (
+            "username,first_name,last_name,email,password",
+            "username4,first4,last4,email4@foo.com,pass4xxx",
+            "username5,first5,last5,email5@foo.com,pass5xxx",
+            "username6,first6,last6,email6@foo.com,pass6xxx",
+        )
+
+        cls.csv_update_data = (
+            "id,first_name,last_name",
+            f"{users[0].pk},first7,last7",
+            f"{users[1].pk},first8,last8",
+            f"{users[2].pk},first9,last9",
+        )
+
+        cls.bulk_edit_data = {
+            'last_name': 'newlastname',
+        }
+
+    def test_password_validation_enforced(self):
+        """
+        Test that any configured password validation rules (AUTH_PASSWORD_VALIDATORS) are enforced.
+        """
+        self.add_permissions('users.add_user')
+        data = {
+            'username': 'new_user',
+            'password': 'F1a',
+            'confirm_password': 'F1a',
+        }
+
+        # Password too short
+        request = {
+            'path': self._get_url('add'),
+            'data': data,
+        }
+        response = self.client.post(**request)
+        self.assertHttpStatus(response, 200)
+
+        # Password long enough
+        data['password'] = 'fooBarFoo123'
+        data['confirm_password'] = 'fooBarFoo123'
+        self.assertHttpStatus(self.client.post(**request), 302)
+
+        # Password no number
+        data['password'] = 'FooBarFooBar'
+        data['confirm_password'] = 'FooBarFooBar'
+        self.assertHttpStatus(self.client.post(**request), 200)
+
+        # Password no letter
+        data['password'] = '123456789123'
+        data['confirm_password'] = '123456789123'
+        self.assertHttpStatus(self.client.post(**request), 200)
+
+        # Password no uppercase
+        data['password'] = 'foobar123abc'
+        data['confirm_password'] = 'foobar123abc'
+        self.assertHttpStatus(self.client.post(**request), 200)
+
+        # Password no lowercase
+        data['password'] = 'FOOBAR123ABC'
+        data['confirm_password'] = 'FOOBAR123ABC'
+        self.assertHttpStatus(self.client.post(**request), 200)
+
+
+class GroupTestCase(
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.CreateObjectViewTestCase,
+    ViewTestCases.EditObjectViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkImportObjectsViewTestCase,
+    ViewTestCases.BulkEditObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase,
+):
+    model = Group
+    maxDiff = None
+
+    @classmethod
+    def setUpTestData(cls):
+
+        groups = (
+            Group(name='group1'),
+            Group(name='group2'),
+            Group(name='group3'),
+        )
+        Group.objects.bulk_create(groups)
+
+        cls.form_data = {
+            'name': 'groupx',
+        }
+
+        cls.csv_data = (
+            "name",
+            "group4"
+            "group5"
+            "group6"
+        )
+
+        cls.csv_update_data = (
+            "id,name",
+            f"{groups[0].pk},group7",
+            f"{groups[1].pk},group8",
+            f"{groups[2].pk},group9",
+        )
+
+        cls.bulk_edit_data = {
+            'description': 'New description',
+        }
+
+
+class ObjectPermissionTestCase(
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.CreateObjectViewTestCase,
+    ViewTestCases.EditObjectViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkEditObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase,
+):
+    model = ObjectPermission
+    maxDiff = None
+
+    @classmethod
+    def setUpTestData(cls):
+        object_type = ObjectType.objects.get_by_natural_key('dcim', 'site')
+
+        permissions = (
+            ObjectPermission(name='Permission 1', actions=['view', 'add', 'delete']),
+            ObjectPermission(name='Permission 2', actions=['view', 'add', 'delete']),
+            ObjectPermission(name='Permission 3', actions=['view', 'add', 'delete']),
+        )
+        ObjectPermission.objects.bulk_create(permissions)
+
+        cls.form_data = {
+            'name': 'Permission X',
+            'description': 'A new permission',
+            'object_types_1': [object_type.pk],  # SplitMultiSelectWidget requires _1 suffix on field name
+            'actions': 'view,edit,delete',
+        }
+
+        cls.csv_data = (
+            "name",
+            "permission4"
+            "permission5"
+            "permission6"
+        )
+
+        cls.csv_update_data = (
+            "id,name,actions",
+            f"{permissions[0].pk},permission7",
+            f"{permissions[1].pk},permission8",
+            f"{permissions[2].pk},permission9",
+        )
+
+        cls.bulk_edit_data = {
+            'description': 'New description',
+        }
+
+
+class TokenTestCase(
+    ViewTestCases.GetObjectViewTestCase,
+    ViewTestCases.CreateObjectViewTestCase,
+    ViewTestCases.EditObjectViewTestCase,
+    ViewTestCases.DeleteObjectViewTestCase,
+    ViewTestCases.ListObjectsViewTestCase,
+    ViewTestCases.BulkImportObjectsViewTestCase,
+    ViewTestCases.BulkEditObjectsViewTestCase,
+    ViewTestCases.BulkDeleteObjectsViewTestCase,
+):
+    model = Token
+    maxDiff = None
+    validation_excluded_fields = ['token', 'user']
+    # Tokens in form_data/csv_data are created for other users, which requires the grant_token permission
+    user_permissions = ('users.grant_token',)
+
+    @classmethod
+    def setUpTestData(cls):
+        users = (
+            create_test_user('User 1'),
+            create_test_user('User 2'),
+        )
+        tokens = (
+            Token(user=users[0]),
+            Token(user=users[0]),
+            Token(user=users[1]),
+        )
+        for token in tokens:
+            token.save()
+
+        cls.form_data = {
+            'version': 2,
+            'user': users[0].pk,
+            'description': 'Test token',
+            'enabled': True,
+        }
+
+        cls.csv_data = (
+            "user,description,enabled,write_enabled",
+            f"{users[0].pk},Test token,true,true",
+            f"{users[1].pk},Test token,true,false",
+            f"{users[1].pk},Test token,false,true",
+        )
+
+        cls.csv_update_data = (
+            "id,description",
+            f"{tokens[0].pk},New description",
+            f"{tokens[1].pk},New description",
+            f"{tokens[2].pk},New description",
+        )
+
+        cls.bulk_edit_data = {
+            'description': 'New description',
+        }
+
+
+class TokenOneTimeAuthStringTestCase(TestCase):
+    """
+    Verify that the plaintext value of a newly-created Token is surfaced exactly once via the detail view, and
+    that it is never persisted in the database.
+    """
+    user_permissions = ('users.add_token', 'users.view_token', 'users.view_user', 'users.grant_token')
+
+    def test_create_stashes_plaintext_and_detail_view_renders_it_once(self):
+        target_user = create_test_user('token_owner')
+
+        # Create a Token via the admin add view
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': target_user.pk,
+            'description': 'one-time-display test',
+            'enabled': 'on',
+            'write_enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+
+        token = Token.objects.get(description='one-time-display test')
+        # Plaintext must NEVER be persisted for v2 tokens
+        self.assertIsNone(token.plaintext)
+        self.assertIsNotNone(token.hmac_digest)
+        self.assertIsNotNone(token.key)
+
+        # Plaintext should be stashed on the session, keyed by token PK
+        session_key = f'_token_plaintext_{token.pk}'
+        self.assertIn(session_key, self.client.session)
+        plaintext = self.client.session[session_key]
+        self.assertEqual(len(plaintext), 40)
+        # Plaintext must validate against the stored digest
+        self.assertTrue(token.validate(plaintext))
+
+        # First GET on the detail view: full auth string should appear and be popped from the session
+        response = self.client.get(token.get_absolute_url())
+        self.assertEqual(response.status_code, 200)
+        expected_auth_string = f'Bearer {TOKEN_PREFIX}{token.key}.{plaintext}'
+        self.assertContains(response, expected_auth_string)
+        self.assertNotIn(session_key, self.client.session)
+
+        # Second GET: the banner must no longer render
+        response = self.client.get(token.get_absolute_url())
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, expected_auth_string)
+        # Specifically, the banner element must be gone
+        self.assertNotContains(response, 'id="new-token-auth-string"')
+
+    def test_form_ignores_user_supplied_token_field(self):
+        """
+        Submitting a 'token' POST parameter should be silently ignored: the model auto-generates plaintext on save.
+        """
+        target_user = create_test_user('token_owner_2')
+
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': target_user.pk,
+            'description': 'ignored-plaintext test',
+            'token': 'attacker_supplied_plaintext_value_xxxxxxx',
+            'enabled': 'on',
+            'write_enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+
+        token = Token.objects.get(description='ignored-plaintext test')
+        # The supplied plaintext must NOT have been used
+        self.assertFalse(token.validate('attacker_supplied_plaintext_value_xxxxxxx'))
+        # Whatever was auto-generated must validate
+        plaintext = self.client.session[f'_token_plaintext_{token.pk}']
+        self.assertTrue(token.validate(plaintext))
+
+
+class TokenGrantPermissionTestCase(TestCase):
+    """
+    Verify that creating a Token for another user via the UI requires the grant_token permission, consistent
+    with REST API enforcement.
+    """
+    user_permissions = ('users.add_token', 'users.change_token', 'users.view_token', 'users.view_user')
+
+    def test_create_token_for_self_without_grant(self):
+        # Creating a Token for oneself should not require the grant_token permission.
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': self.user.pk,
+            'description': 'self token',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Token.objects.filter(description='self token', user=self.user).exists())
+
+    def test_create_token_for_other_user_without_grant(self):
+        # Creating a Token for another user without the grant_token permission should be prohibited.
+        other_user = create_test_user('other_user')
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': other_user.pk,
+            'description': 'other token',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Token.objects.filter(user=other_user).exists())
+
+    def test_create_token_for_other_user_with_grant(self):
+        # Creating a Token for another user with the grant_token permission should succeed.
+        self.add_permissions('users.grant_token')
+        other_user = create_test_user('other_user')
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': other_user.pk,
+            'description': 'other token',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Token.objects.filter(description='other token', user=other_user).exists())
+
+    def test_edit_token_for_other_user_without_grant(self):
+        # Editing an existing Token owned by another user should not require the grant_token permission, since
+        # the user field is read-only on edits (consistent with the REST API).
+        other_user = create_test_user('other_user')
+        token = Token.objects.create(user=other_user, description='original')
+        response = self.client.post(reverse('users:token_edit', kwargs={'pk': token.pk}), data={
+            'version': token.version,
+            'user': other_user.pk,
+            'description': 'updated',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+        token.refresh_from_db()
+        self.assertEqual(token.description, 'updated')
+
+    def test_bulk_import_token_for_other_user_without_grant(self):
+        # Bulk-importing a Token for another user without the grant_token permission should be prohibited.
+        other_user = create_test_user('other_user')
+        csv_data = '\n'.join((
+            "user,description",
+            f"{other_user.pk},imported token",
+        ))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Token.objects.filter(user=other_user).exists())
+
+    def test_bulk_import_token_for_other_user_with_grant(self):
+        # Bulk-importing a Token for another user with the grant_token permission should succeed.
+        self.add_permissions('users.grant_token')
+        other_user = create_test_user('other_user')
+        csv_data = '\n'.join((
+            "user,description",
+            f"{other_user.pk},imported token",
+        ))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Token.objects.filter(description='imported token', user=other_user).exists())
+
+    def test_bulk_update_token_for_other_user_without_grant(self):
+        # Bulk-updating an existing Token owned by another user should not require the grant_token permission,
+        # even when the CSV includes the (unchanged) user column. Consistent with the UI edit path.
+        other_user = create_test_user('other_user')
+        token = Token.objects.create(user=other_user, description='original')
+        csv_data = '\n'.join((
+            "id,user,description",
+            f"{token.pk},{other_user.pk},updated",
+        ))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 302)
+        token.refresh_from_db()
+        self.assertEqual(token.description, 'updated')
+
+    def test_bulk_update_cannot_reassign_token_owner(self):
+        # A bulk update must not be able to reassign a Token's owner, regardless of the grant_token permission
+        # (the user field is read-only on update, consistent with the REST API).
+        self.add_permissions('users.grant_token')
+        owner = create_test_user('owner')
+        new_owner = create_test_user('new_owner')
+        token = Token.objects.create(user=owner, description='original')
+        csv_data = '\n'.join((
+            "id,user,description",
+            f"{token.pk},{new_owner.pk},updated",
+        ))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 302)
+        token.refresh_from_db()
+        self.assertEqual(token.user, owner)
+        self.assertEqual(token.description, 'updated')
+
+    def _add_constrained_grant_permission(self, constraints):
+        """Add a constrained grant_token ObjectPermission to self.user."""
+        token_ct = ObjectType.objects.get_by_natural_key('users', 'token')
+        perm = ObjectPermission(
+            name='constrained_grant_token',
+            constraints=constraints,
+            actions=['grant'],
+        )
+        perm.save()
+        perm.users.add(self.user)
+        perm.object_types.add(token_ct)
+
+    def test_create_token_via_form_constrained_grant_is_enforced(self):
+        """
+        Regression: SR-001 / VM-322 — constrained grant_token ObjectPermissions must not
+        be bypassed via the UI create form. has_perm(obj=None) short-circuits to True
+        without evaluating constraints; user_may_grant_token() applies them correctly.
+        """
+        superuser = User.objects.create_user(username='form_constrained_super', is_superuser=True)
+        regular = User.objects.create_user(username='form_constrained_regular')
+        self._add_constrained_grant_permission({'user__is_superuser': False})
+
+        # Constrained grant must deny token creation for a superuser.
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': superuser.pk,
+            'description': 'constrained denied',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Token.objects.filter(user=superuser).exists())
+
+        # Constrained grant must allow token creation for a non-superuser.
+        response = self.client.post(reverse('users:token_add'), data={
+            'version': 2,
+            'user': regular.pk,
+            'description': 'constrained allowed',
+            'enabled': 'on',
+        })
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Token.objects.filter(description='constrained allowed', user=regular).exists())
+
+    def test_bulk_import_token_constrained_grant_is_enforced(self):
+        """
+        Regression: SR-001 / VM-322 — constrained grant_token ObjectPermissions must not
+        be bypassed via bulk CSV import. has_perm(obj=None) short-circuits to True
+        without evaluating constraints; user_may_grant_token() applies them correctly.
+        """
+        superuser = User.objects.create_user(username='bulk_constrained_super', is_superuser=True)
+        regular = User.objects.create_user(username='bulk_constrained_regular')
+        self._add_constrained_grant_permission({'user__is_superuser': False})
+
+        # Constrained grant must deny bulk import for a superuser.
+        csv_data = '\n'.join(('user,description', f"{superuser.pk},bulk denied"))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Token.objects.filter(user=superuser).exists())
+
+        # Constrained grant must allow bulk import for a non-superuser.
+        csv_data = '\n'.join(('user,description', f"{regular.pk},bulk allowed"))
+        response = self.client.post(reverse('users:token_bulk_import'), data={
+            'data': csv_data,
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        })
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(Token.objects.filter(description='bulk allowed', user=regular).exists())
+
+
+class OwnerGroupTestCase(ViewTestCases.AdminModelViewTestCase):
+    model = OwnerGroup
+
+    @classmethod
+    def setUpTestData(cls):
+        owner_groups = (
+            OwnerGroup(name='Owner Group 1'),
+            OwnerGroup(name='Owner Group 2'),
+            OwnerGroup(name='Owner Group 3'),
+        )
+        OwnerGroup.objects.bulk_create(owner_groups)
+
+        cls.form_data = {
+            'name': 'Owner Group X',
+            'description': 'A new owner group',
+        }
+
+        cls.csv_data = (
+            "name,description",
+            "Owner Group 4,Foo",
+            "Owner Group 5,Bar",
+            "Owner Group 6,Baz",
+        )
+
+        cls.csv_update_data = (
+            "id,description",
+            f"{owner_groups[0].pk},Foo",
+            f"{owner_groups[1].pk},Bar",
+            f"{owner_groups[2].pk},Baz",
+        )
+
+        cls.bulk_edit_data = {
+            'description': 'New description',
+        }
+
+
+class OwnerTestCase(ViewTestCases.AdminModelViewTestCase):
+    model = Owner
+
+    @classmethod
+    def setUpTestData(cls):
+        groups = (
+            Group(name='Group 1'),
+            Group(name='Group 2'),
+            Group(name='Group 3'),
+        )
+        Group.objects.bulk_create(groups)
+
+        users = (
+            User(username='User 1'),
+            User(username='User 2'),
+            User(username='User 3'),
+        )
+        User.objects.bulk_create(users)
+
+        owner_groups = (
+            OwnerGroup(name='Owner Group 1'),
+            OwnerGroup(name='Owner Group 2'),
+            OwnerGroup(name='Owner Group 3'),
+            OwnerGroup(name='Owner Group 4'),
+        )
+        OwnerGroup.objects.bulk_create(owner_groups)
+
+        owners = (
+            Owner(name='Owner 1'),
+            Owner(name='Owner 2'),
+            Owner(name='Owner 3'),
+        )
+        Owner.objects.bulk_create(owners)
+
+        # Assign users and groups to owners
+        owners[0].user_groups.add(groups[0])
+        owners[1].user_groups.add(groups[1])
+        owners[2].user_groups.add(groups[2])
+        owners[0].users.add(users[0])
+        owners[1].users.add(users[1])
+        owners[2].users.add(users[2])
+
+        cls.form_data = {
+            'name': 'Owner X',
+            'group': owner_groups[3].pk,
+            'user_groups': [groups[0].pk, groups[1].pk],
+            'users': [users[0].pk, users[1].pk],
+            'description': 'A new owner',
+        }
+
+        cls.csv_data = (
+            "name,group,description",
+            "Owner 4,Owner Group 4,Foo",
+            "Owner 5,Owner Group 4,Bar",
+            "Owner 6,Owner Group 4,Baz",
+        )
+
+        cls.csv_update_data = (
+            "id,description",
+            f"{owners[0].pk},Foo",
+            f"{owners[1].pk},Bar",
+            f"{owners[2].pk},Baz",
+        )
+
+        cls.bulk_edit_data = {
+            'description': 'New description',
+        }
+
+    def test_related_objects_list_owned_objects(self):
+        """An object assigned to an owner appears among the owner's related models."""
+        owner = Owner.objects.get(name='Owner 1')
+        Site.objects.create(name='Site 1', slug='site-1', owner=owner)
+        self.add_permissions('users.view_owner', 'dcim.view_site')
+
+        response = self.client.get(owner.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+
+        related = {roc.queryset.model: roc for roc in response.context['related_models']}
+        self.assertIn(Site, related)
+        self.assertEqual(related[Site].filter_param, 'owner_id')
+        self.assertEqual(related[Site].queryset.count(), 1)
+
+    def test_related_objects_honor_object_permissions(self):
+        """An owned object the user cannot view is omitted from the owner's related models."""
+        owner = Owner.objects.get(name='Owner 1')
+        Site.objects.create(name='Site 1', slug='site-1', owner=owner)
+        self.add_permissions('users.view_owner')
+
+        response = self.client.get(owner.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+
+        self.assertEqual(response.context['related_models'], [])
+
+    def test_related_objects_honor_constrained_permissions(self):
+        """A related model reports only the owned objects the user is permitted to view."""
+        owner = Owner.objects.get(name='Owner 1')
+        site1 = Site.objects.create(name='Site 1', slug='site-1', owner=owner)
+        Site.objects.create(name='Site 2', slug='site-2', owner=owner)
+        self.add_permissions('users.view_owner')
+
+        obj_perm = ObjectPermission(
+            name='Test permission',
+            constraints={'pk': site1.pk},
+            actions=['view']
+        )
+        obj_perm.save()
+        obj_perm.users.add(self.user)
+        obj_perm.object_types.add(ObjectType.objects.get_for_model(Site))
+
+        response = self.client.get(owner.get_absolute_url())
+        self.assertHttpStatus(response, 200)
+
+        related = {roc.queryset.model: roc for roc in response.context['related_models']}
+        self.assertIn(Site, related)
+        self.assertEqual(list(related[Site].queryset), [site1])
