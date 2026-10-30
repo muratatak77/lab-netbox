@@ -43,7 +43,7 @@ def humanize_duration(value):
         ret += f'{hours}h '
     if minutes:
         ret += f'{minutes}m '
-    if seconds:
+    if seconds or not ret:
         ret += f'{seconds}s'
     ret = ret.strip()
 
