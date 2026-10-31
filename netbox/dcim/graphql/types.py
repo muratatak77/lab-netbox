@@ -82,6 +82,7 @@ __all__ = (
     'ModuleType',
     'ModuleTypeProfileType',
     'ModuleTypeType',
+    'OUIType',
     'PlatformType',
     'PowerFeedType',
     'PowerOutletTemplateType',
@@ -525,6 +526,18 @@ class FrontPortTemplateType(ModularComponentTemplateType):
 
 
 @register_type(
+    models.OUI,
+    fields='__all__',
+    filters=OUIFilter,
+    pagination=True
+)
+class OUIType(PrimaryObjectType):
+    prefix: str
+    manufacturer: Annotated["ManufacturerType", strawberry.lazy('dcim.graphql.types')] | None
+    mac_addresses: list[Annotated["MACAddressType", strawberry.lazy('dcim.graphql.types')]]
+
+
+@register_type(
     models.MACAddress,
     exclude=['assigned_object_type', 'assigned_object_id'],
     filters=MACAddressFilter,
@@ -532,6 +545,7 @@ class FrontPortTemplateType(ModularComponentTemplateType):
 )
 class MACAddressType(PrimaryObjectType):
     mac_address: str
+    oui: Annotated["OUIType", strawberry.lazy('dcim.graphql.types')] | None
 
     @strawberry_django.field(
         prefetch_related=build_gfk_prefetch(
@@ -704,6 +718,7 @@ class ManufacturerType(OrganizationalObjectType, ContactsMixin):
     inventory_item_templates: list[Annotated["InventoryItemTemplateType", strawberry.lazy('dcim.graphql.types')]]
     inventory_items: list[Annotated["InventoryItemType", strawberry.lazy('dcim.graphql.types')]]
     module_types: list[Annotated["ModuleTypeType", strawberry.lazy('dcim.graphql.types')]]
+    ouis: list[Annotated["OUIType", strawberry.lazy('dcim.graphql.types')]]
 
 
 @register_type(

@@ -583,6 +583,12 @@ class MACAddressViewSet(NetBoxModelViewSet):
     filterset_class = filtersets.MACAddressFilterSet
 
 
+class OUIViewSet(NetBoxModelViewSet):
+    queryset = OUI.objects.all()
+    serializer_class = serializers.OUISerializer
+    filterset_class = filtersets.OUIFilterSet
+
+
 #
 # Cables
 #

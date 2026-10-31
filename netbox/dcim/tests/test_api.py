@@ -6928,6 +6928,52 @@ class VirtualDeviceContextTestCase(APIViewTestCases.APIViewTestCase):
         )
 
 
+class OUITestCase(APIViewTestCases.APIViewTestCase):
+    model = OUI
+    brief_fields = ['description', 'display', 'id', 'manufacturer', 'prefix', 'url']
+    bulk_update_data = {
+        'description': 'New description',
+    }
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.manufacturer = Manufacturer.objects.create(name='Manufacturer 1', slug='manufacturer-1')
+        OUI.objects.bulk_create((
+            OUI(prefix='00:00:01', manufacturer=cls.manufacturer),
+            OUI(prefix='00:00:02', manufacturer=cls.manufacturer),
+            OUI(prefix='00:00:03'),
+        ))
+
+        cls.create_data = [
+            {'prefix': '00:00:04', 'manufacturer': cls.manufacturer.pk},
+            {'prefix': '00:00:05', 'description': 'OUI 5'},
+            {'prefix': '00:00:06'},
+        ]
+
+    def test_prefix_normalized(self):
+        self.add_permissions('dcim.add_oui')
+        response = self.client.post(self._get_list_url(), {'prefix': '00-1b-21'}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['prefix'], '00:1B:21')
+        self.assertTrue(OUI.objects.filter(prefix='00:1B:21').exists())
+
+    def test_duplicate_prefix_in_other_notation(self):
+        self.add_permissions('dcim.add_oui')
+        response = self.client.post(self._get_list_url(), {'prefix': '00-00-01'}, format='json', **self.header)
+        self.assertHttpStatus(response, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(OUI.objects.filter(prefix='00:00:01').count(), 1)
+
+    def test_mac_address_count(self):
+        self.add_permissions('dcim.view_oui')
+        oui = OUI.objects.get(prefix='00:00:03')
+        MACAddress.objects.create(mac_address='00:00:03:00:00:01')
+        MACAddress.objects.create(mac_address='00:00:03:00:00:02')
+
+        response = self.client.get(self._get_detail_url(oui), **self.header)
+        self.assertHttpStatus(response, status.HTTP_200_OK)
+        self.assertEqual(response.data['mac_address_count'], 2)
+
+
 class MACAddressTestCase(APIViewTestCases.APIViewTestCase):
     model = MACAddress
     brief_fields = ['description', 'display', 'id', 'mac_address', 'url']
@@ -6972,6 +7018,59 @@ class MACAddressTestCase(APIViewTestCases.APIViewTestCase):
                 'mac_address': '00:00:00:00:00:06',
             },
         ]
+
+    def test_oui_field(self):
+        """
+        The read-only OUI should be derived from the address, and include its manufacturer.
+        """
+        self.add_permissions('dcim.add_macaddress', 'dcim.view_macaddress')
+        manufacturer = Manufacturer.objects.create(name='Intel', slug='intel')
+        oui = OUI.objects.create(prefix='00:1B:21', manufacturer=manufacturer)
+
+        response = self.client.post(
+            self._get_list_url(), {'mac_address': '00:1B:21:00:00:01'}, format='json', **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['oui']['id'], oui.pk)
+        self.assertEqual(response.data['oui']['manufacturer']['id'], manufacturer.pk)
+
+        # A client can't override the derived value
+        response = self.client.post(
+            self._get_list_url(), {'mac_address': '00:1B:22:00:00:01', 'oui': oui.pk}, format='json', **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['oui']['prefix'], '00:1B:22')
+        self.assertIsNone(response.data['oui']['manufacturer'])
+
+        # Addresses without an OUI are represented with a null value
+        response = self.client.post(
+            self._get_list_url(), {'mac_address': '02:00:00:00:00:01'}, format='json', **self.header
+        )
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        self.assertIsNone(response.data['oui'])
+
+    def test_list_query_count_independent_of_oui_count(self):
+        """
+        Listing MAC addresses should not query for the manufacturer of each one.
+        """
+        self.add_permissions('dcim.view_macaddress')
+        url = f'{self._get_list_url()}?oui__n=null'
+        manufacturer = Manufacturer.objects.create(name='Intel', slug='intel')
+
+        def count_queries():
+            with CaptureQueriesContext(connection) as queries:
+                self.assertHttpStatus(self.client.get(url, **self.header), status.HTTP_200_OK)
+            return len(queries.captured_queries)
+
+        OUI.objects.create(prefix='00:1B:21', manufacturer=manufacturer)
+        MACAddress.objects.create(mac_address='00:1B:21:00:00:01')
+        count_queries()  # Populate any caches
+        baseline = count_queries()
+
+        for i in range(2, 6):
+            OUI.objects.create(prefix=f'00:1B:{i:02X}', manufacturer=manufacturer)
+            MACAddress.objects.create(mac_address=f'00:1B:{i:02X}:00:00:01')
+        self.assertEqual(count_queries(), baseline)
 
     def test_is_primary_field(self):
         """

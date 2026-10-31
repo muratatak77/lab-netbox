@@ -231,6 +231,7 @@ nav:
             - ModuleBayType: 'models/dcim/modulebaytype.md'
             - ModuleType: 'models/dcim/moduletype.md'
             - ModuleTypeProfile: 'models/dcim/moduletypeprofile.md'
+            - OUI: 'models/dcim/oui.md'
             - Platform: 'models/dcim/platform.md'
             - PowerFeed: 'models/dcim/powerfeed.md'
             - PowerOutlet: 'models/dcim/poweroutlet.md'

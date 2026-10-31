@@ -70,6 +70,7 @@ __all__ = (
     'ModuleBulkEditForm',
     'ModuleTypeBulkEditForm',
     'ModuleTypeProfileBulkEditForm',
+    'OUIBulkEditForm',
     'PlatformBulkEditForm',
     'PowerFeedBulkEditForm',
     'PowerOutletBulkEditForm',
@@ -2276,6 +2277,20 @@ class VirtualDeviceContextBulkEditForm(PrimaryModelBulkEditForm):
 #
 # Addressing
 #
+
+class OUIBulkEditForm(PrimaryModelBulkEditForm):
+    manufacturer = DynamicModelChoiceField(
+        label=_('Manufacturer'),
+        queryset=Manufacturer.objects.all(),
+        required=False
+    )
+
+    model = OUI
+    fieldsets = (
+        FieldSet('manufacturer', 'description'),
+    )
+    nullable_fields = ('manufacturer', 'description', 'comments')
+
 
 class MACAddressBulkEditForm(PrimaryModelBulkEditForm):
     model = MACAddress

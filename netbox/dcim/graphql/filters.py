@@ -104,6 +104,7 @@ __all__ = (
     'ModuleFilter',
     'ModuleTypeFilter',
     'ModuleTypeProfileFilter',
+    'OUIFilter',
     'PlatformFilter',
     'PortMappingFilter',
     'PortTemplateMappingFilter',
@@ -512,9 +513,20 @@ class PortTemplateMappingFilter(BaseModelFilter):
     rear_port_position: FilterLookup[int] | None = strawberry_django.filter_field()
 
 
+@register_filter(models.OUI, lookups=True)
+class OUIFilter(PrimaryModelFilter):
+    prefix: StrFilterLookup | None = strawberry_django.filter_field()
+    manufacturer: Annotated['ManufacturerFilter', strawberry.lazy('dcim.graphql.filters')] | None = (
+        strawberry_django.filter_field()
+    )
+    manufacturer_id: ID | None = strawberry_django.filter_field()
+
+
 @register_filter(models.MACAddress, lookups=True)
 class MACAddressFilter(PrimaryModelFilter):
     mac_address: StrFilterLookup | None = strawberry_django.filter_field()
+    oui: Annotated['OUIFilter', strawberry.lazy('dcim.graphql.filters')] | None = strawberry_django.filter_field()
+    oui_id: ID | None = strawberry_django.filter_field()
     assigned_object_type: Annotated['ContentTypeFilter', strawberry.lazy('core.graphql.filters')] | None = (
         strawberry_django.filter_field()
     )

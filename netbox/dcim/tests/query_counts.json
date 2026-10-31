@@ -59,6 +59,8 @@
   "moduletype:list_objects_with_permission": 18,
   "moduletypeprofile:api_list_objects": 12,
   "moduletypeprofile:list_objects_with_permission": 16,
+  "oui:api_list_objects": 13,
+  "oui:list_objects_with_permission": 17,
   "platform:api_list_objects": 12,
   "platform:list_objects_with_permission": 17,
   "powerconnection:list_objects_with_permission": 28,

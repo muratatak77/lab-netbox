@@ -80,6 +80,7 @@ __all__ = (
     'ModuleForm',
     'ModuleTypeForm',
     'ModuleTypeProfileForm',
+    'OUIForm',
     'PlatformForm',
     'PopulateDeviceBayForm',
     'PowerFeedForm',
@@ -2510,6 +2511,22 @@ class VirtualDeviceContextForm(TenancyForm, PrimaryModelForm):
 #
 # Addressing
 #
+
+class OUIForm(PrimaryModelForm):
+    manufacturer = DynamicModelChoiceField(
+        label=_('Manufacturer'),
+        queryset=Manufacturer.objects.all(),
+        required=False
+    )
+
+    fieldsets = (
+        FieldSet('prefix', 'manufacturer', 'description', 'tags', name=_('OUI')),
+    )
+
+    class Meta:
+        model = OUI
+        fields = ['prefix', 'manufacturer', 'description', 'owner', 'comments', 'tags']
+
 
 class MACAddressForm(PrimaryModelForm):
     mac_address = forms.CharField(

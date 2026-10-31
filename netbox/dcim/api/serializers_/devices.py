@@ -20,6 +20,7 @@ from virtualization.api.serializers_.clusters import ClusterSerializer
 
 from .devicetypes import *
 from .nested import NestedDeviceBaySerializer, NestedDeviceSerializer, NestedModuleBaySerializer
+from .ouis import OUISerializer
 from .platforms import PlatformSerializer
 from .racks import RackSerializer
 from .roles import DeviceRoleSerializer
@@ -328,6 +329,7 @@ class ModuleSerializer(PrimaryModelSerializer):
 
 
 class MACAddressSerializer(PrimaryModelSerializer):
+    oui = OUISerializer(nested=True, read_only=True)
     assigned_object_type = ContentTypeField(
         queryset=ContentType.objects.filter(MACADDRESS_ASSIGNMENT_MODELS),
         required=False,
@@ -339,7 +341,7 @@ class MACAddressSerializer(PrimaryModelSerializer):
     class Meta:
         model = MACAddress
         fields = [
-            'id', 'url', 'display_url', 'display', 'mac_address', 'assigned_object_type', 'assigned_object_id',
+            'id', 'url', 'display_url', 'display', 'mac_address', 'oui', 'assigned_object_type', 'assigned_object_id',
             'assigned_object', 'is_primary', 'description', 'owner', 'comments', 'tags', 'custom_fields', 'created',
             'last_updated',
         ]

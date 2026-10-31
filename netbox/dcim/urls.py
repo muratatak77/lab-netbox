@@ -206,6 +206,9 @@ urlpatterns = [
     path('cooling-feeds/', include(get_model_urls('dcim', 'coolingfeed', detail=False))),
     path('cooling-feeds/<int:pk>/', include(get_model_urls('dcim', 'coolingfeed'))),
 
+    path('ouis/', include(get_model_urls('dcim', 'oui', detail=False))),
+    path('ouis/<int:pk>/', include(get_model_urls('dcim', 'oui'))),
+
     path('mac-addresses/', include(get_model_urls('dcim', 'macaddress', detail=False))),
     path('mac-addresses/<int:pk>/', include(get_model_urls('dcim', 'macaddress'))),
 

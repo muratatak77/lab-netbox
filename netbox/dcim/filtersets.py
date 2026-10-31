@@ -85,6 +85,7 @@ __all__ = (
     'ModuleFilterSet',
     'ModuleTypeFilterSet',
     'ModuleTypeProfileFilterSet',
+    'OUIFilterSet',
     'PathEndpointFilterSet',
     'PlatformFilterSet',
     'PowerConnectionFilterSet',
@@ -2232,8 +2233,63 @@ class CoolingOutflowFilterSet(ModularDeviceComponentFilterSet):
 
 
 @register_filterset
+class OUIFilterSet(PrimaryModelFilterSet):
+    manufacturer_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=Manufacturer.objects.all(),
+        distinct=False,
+        label=_('Manufacturer (ID)'),
+    )
+    manufacturer = django_filters.ModelMultipleChoiceFilter(
+        field_name='manufacturer__slug',
+        queryset=Manufacturer.objects.all(),
+        distinct=False,
+        to_field_name='slug',
+        label=_('Manufacturer (slug)'),
+    )
+
+    class Meta:
+        model = OUI
+        fields = ('id', 'prefix', 'description')
+
+    def search(self, queryset, name, value):
+        if not value.strip():
+            return queryset
+        qs_filter = (
+            Q(prefix__icontains=value) |
+            Q(manufacturer__name__icontains=value) |
+            Q(description__icontains=value)
+        )
+        return queryset.filter(qs_filter)
+
+
+@register_filterset
 class MACAddressFilterSet(PrimaryModelFilterSet):
     mac_address = MultiValueMACAddressFilter()
+    oui_id = django_filters.ModelMultipleChoiceFilter(
+        queryset=OUI.objects.all(),
+        distinct=False,
+        label=_('OUI (ID)'),
+    )
+    oui = django_filters.ModelMultipleChoiceFilter(
+        field_name='oui__prefix',
+        queryset=OUI.objects.all(),
+        distinct=False,
+        to_field_name='prefix',
+        label=_('OUI (prefix)'),
+    )
+    manufacturer_id = django_filters.ModelMultipleChoiceFilter(
+        field_name='oui__manufacturer',
+        queryset=Manufacturer.objects.all(),
+        distinct=False,
+        label=_('Manufacturer (ID)'),
+    )
+    manufacturer = django_filters.ModelMultipleChoiceFilter(
+        field_name='oui__manufacturer__slug',
+        queryset=Manufacturer.objects.all(),
+        distinct=False,
+        to_field_name='slug',
+        label=_('Manufacturer (slug)'),
+    )
     assigned_object_type = MultiValueContentTypeFilter()
     device = MultiValueCharFilter(
         method='filter_device',

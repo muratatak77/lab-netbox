@@ -66,6 +66,9 @@ class DCIMQuery:
     mac_address: MACAddressType = strawberry_django.field()
     mac_address_list: list[MACAddressType] = strawberry_django.field()
 
+    oui: OUIType = strawberry_django.field()
+    oui_list: list[OUIType] = strawberry_django.field()
+
     interface: InterfaceType = strawberry_django.field()
     interface_list: list[InterfaceType] = strawberry_django.field()
 

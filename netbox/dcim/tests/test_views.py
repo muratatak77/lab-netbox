@@ -6497,6 +6497,78 @@ class VirtualDeviceContextTestCase(ViewTestCases.PrimaryObjectViewTestCase):
         self.assertEqual(vdc.device, device)
 
 
+class OUITestCase(ViewTestCases.PrimaryObjectViewTestCase):
+    model = OUI
+
+    @classmethod
+    def setUpTestData(cls):
+        manufacturers = (
+            Manufacturer(name='Manufacturer 1', slug='manufacturer-1'),
+            Manufacturer(name='Manufacturer 2', slug='manufacturer-2'),
+        )
+        Manufacturer.objects.bulk_create(manufacturers)
+
+        ouis = (
+            OUI(prefix='00:00:01', manufacturer=manufacturers[0]),
+            OUI(prefix='00:00:02', manufacturer=manufacturers[0]),
+            OUI(prefix='00:00:03'),
+        )
+        OUI.objects.bulk_create(ouis)
+
+        tags = create_tags('Alpha', 'Bravo', 'Charlie')
+
+        cls.form_data = {
+            'prefix': '00:00:04',
+            'manufacturer': manufacturers[1].pk,
+            'description': 'New OUI',
+            'tags': [t.pk for t in tags],
+        }
+
+        cls.csv_data = (
+            "prefix,manufacturer,description",
+            "00:00:04,manufacturer-1,OUI 4",
+            "00-00-05,manufacturer-2,OUI 5",
+            "00:00:06,,OUI 6",
+        )
+
+        cls.csv_update_data = (
+            "id,manufacturer,description",
+            f"{ouis[0].pk},manufacturer-2,Updated OUI 1",
+            f"{ouis[1].pk},manufacturer-2,Updated OUI 2",
+            f"{ouis[2].pk},manufacturer-2,Updated OUI 3",
+        )
+
+        cls.bulk_edit_data = {
+            'manufacturer': manufacturers[1].pk,
+            'description': 'New description',
+        }
+
+    def test_bulk_import_new_and_existing(self):
+        """
+        A single import may create OUIs and update existing ones, as produced by scripts/oui_to_csv.py.
+        """
+        self.add_permissions('dcim.add_oui', 'dcim.change_oui', 'dcim.view_oui', 'dcim.view_manufacturer')
+        oui = OUI.objects.get(prefix='00:00:03')
+
+        csv_data = (
+            "id,prefix,manufacturer,description",
+            f"{oui.pk},00:00:03,manufacturer-1,Existing",
+            ",00:00:07,manufacturer-1,New",
+        )
+        data = {
+            'data': '\n'.join(csv_data),
+            'format': ImportFormatChoices.CSV,
+            'csv_delimiter': CSVDelimiterChoices.AUTO,
+        }
+        response = self.client.post(self._get_url('bulk_import'), data)
+        self.assertHttpStatus(response, 302)
+
+        oui.refresh_from_db()
+        self.assertEqual(oui.description, 'Existing')
+        self.assertEqual(oui.manufacturer.slug, 'manufacturer-1')
+        self.assertEqual(OUI.objects.get(prefix='00:00:07').description, 'New')
+
+
 class MACAddressTestCase(ViewTestCases.PrimaryObjectViewTestCase):
     model = MACAddress
 
