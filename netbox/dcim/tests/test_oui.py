@@ -9,6 +9,7 @@ from django.apps import apps
 from django.conf import settings
 from django.db import connection
 from django.test import SimpleTestCase, TestCase
+from django.test.utils import CaptureQueriesContext
 
 from dcim.models import OUI, MACAddress, Manufacturer
 
@@ -47,6 +48,12 @@ class PopulateMACAddressOUIsTestCase(TestCase):
 
         unlinked = MACAddress.objects.filter(oui__isnull=True).values_list('mac_address', flat=True)
         self.assertEqual(sorted(str(mac) for mac in unlinked), ['01:00:5E:00:00:01', '02:00:00:00:00:01'])
+
+    def test_linked_in_single_update(self):
+        with CaptureQueriesContext(connection) as ctx:
+            self.populate()
+        updates = [q['sql'] for q in ctx.captured_queries if q['sql'].startswith('UPDATE "dcim_macaddress"')]
+        self.assertEqual(len(updates), 1)
 
     def test_last_updated_preserved(self):
         before = dict(MACAddress.objects.values_list('pk', 'last_updated'))

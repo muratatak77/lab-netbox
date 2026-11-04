@@ -1503,8 +1503,13 @@ class OUI(PrimaryModel):
     def clean(self):
         super().clean()
 
-        # get_oui_prefix() returns None for anything other than a universally administered unicast address
-        if self.prefix and get_oui_prefix(f'{self.prefix}:00:00:00') is None:
+        # get_oui_prefix() returns None for anything other than a universally administered unicast address. A malformed
+        # prefix has already been reported by the field's validator, so it is skipped here rather than reported twice.
+        try:
+            non_universal = bool(self.prefix) and get_oui_prefix(f'{self.prefix}:00:00:00') is None
+        except ValidationError:
+            non_universal = False
+        if non_universal:
             raise ValidationError({
                 'prefix': _("An OUI cannot have the multicast or locally administered bit set.")
             })
@@ -1564,6 +1569,9 @@ class MACAddress(PrimaryModel):
         self._original_assigned_object_id = self.__dict__.get('assigned_object_id')
         self._original_assigned_object_type_id = self.__dict__.get('assigned_object_type_id')
 
+        # Denote the original address, so that save() looks up the OUI only when the address has changed
+        self._original_mac_address = self.__dict__.get('mac_address')
+
     @cached_property
     def is_primary(self):
         # Compare against primary_mac_address_id (a column already loaded on the assigned object) rather than
@@ -1578,12 +1586,16 @@ class MACAddress(PrimaryModel):
 
     def save(self, *args, **kwargs):
         update_fields = normalize_update_fields(kwargs)
-        if update_fields is None or 'mac_address' in update_fields:
-            prefix = get_oui_prefix(self.mac_address)
-            self.oui = OUI.objects.get_or_create(prefix=prefix)[0] if prefix else None
+        writes_address = update_fields is None or 'mac_address' in update_fields
+        if writes_address:
+            if self._state.adding or self.oui_id is None or self.mac_address != self._original_mac_address:
+                prefix = get_oui_prefix(self.mac_address)
+                self.oui = OUI.objects.get_or_create(prefix=prefix)[0] if prefix else None
             if update_fields is not None:
                 kwargs['update_fields'] = update_fields | {'oui'}
         super().save(*args, **kwargs)
+        if writes_address:
+            self._original_mac_address = self.mac_address
 
     def clean(self, *args, **kwargs):
         super().clean()
