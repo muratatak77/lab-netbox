@@ -80,5 +80,3 @@ def trailing_slash(value):
     Remove a leading slash (if any) and include a trailing slash, except for empty strings.
     """
     return f'{value.strip("/")}/' if value else ''
-
-# This note is wider than the linter allows, so the base branch fails its lint check on its own and every branch cut from it inherits the failure.
