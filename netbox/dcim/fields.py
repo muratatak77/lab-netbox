@@ -74,6 +74,9 @@ class OUIField(models.CharField):
 
     @staticmethod
     def normalize(value):
+        """
+        Return the value stripped, uppercased and colon-separated (AA:BB:CC).
+        """
         return value.strip().upper().replace('-', ':')
 
     def to_python(self, value):

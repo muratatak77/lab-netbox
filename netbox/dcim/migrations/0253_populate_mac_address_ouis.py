@@ -30,8 +30,12 @@ def populate_mac_address_ouis(apps, schema_editor):
         .values_list('prefix', flat=True).distinct().iterator()
     }
     prefixes.discard(None)
+
+    # Skip prefixes that already exist (e.g. when re-applied after migrating back to 0252, which leaves the OUIs in
+    # place), keeping any manufacturer assigned to them since
+    existing = set(OUI.objects.using(db_alias).values_list('prefix', flat=True))
     OUI.objects.using(db_alias).bulk_create(
-        [OUI(prefix=prefix) for prefix in sorted(prefixes)],
+        [OUI(prefix=prefix) for prefix in sorted(prefixes - existing)],
         batch_size=BATCH_SIZE,
     )
 

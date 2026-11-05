@@ -1582,6 +1582,9 @@ class MACAddress(PrimaryModel):
 
     @property
     def manufacturer(self):
+        """
+        Return the Manufacturer assigned to this address's OUI, or None if there is no OUI or it has no manufacturer.
+        """
         return self.oui.manufacturer if self.oui else None
 
     def save(self, *args, **kwargs):

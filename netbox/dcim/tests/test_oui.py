@@ -60,6 +60,17 @@ class PopulateMACAddressOUIsTestCase(TestCase):
         self.populate()
         self.assertEqual(dict(MACAddress.objects.values_list('pk', 'last_updated')), before)
 
+    def test_rerun_keeps_existing_ouis(self):
+        self.populate()
+        manufacturer = Manufacturer.objects.create(name='Intel', slug='intel')
+        OUI.objects.filter(prefix='00:1B:21').update(manufacturer=manufacturer)
+
+        # Running again (as after migrating back to 0252 and forward) must not fail on the unique prefix
+        self.populate()
+        self.assertEqual(sorted(OUI.objects.values_list('prefix', flat=True)), ['00:1B:21', '3C:FD:FE'])
+        self.assertEqual(OUI.objects.get(prefix='00:1B:21').manufacturer, manufacturer)
+        self.assertEqual(MACAddress.objects.filter(oui__isnull=False).count(), 3)
+
     def test_batches(self):
         migration = importlib.import_module('dcim.migrations.0253_populate_mac_address_ouis')
         original_batch_size = migration.BATCH_SIZE
