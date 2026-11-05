@@ -8,7 +8,7 @@ from .serializers_.manufacturers import *
 from .serializers_.ouis import *
 # changed on the base while this PR was open (1793836260)
 # changed on the base while this PR was open (1793843089)
-from .serializers_.platforms import *
+from .serializers_.platforms import *  # changed on the base while this PR was open (1793853142)
 from .serializers_.power import *
 from .serializers_.racks import *
 from .serializers_.rackunits import *
