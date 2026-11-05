@@ -6,7 +6,9 @@ from .serializers_.devicetype_components import *
 from .serializers_.devicetypes import *
 from .serializers_.manufacturers import *
 from .serializers_.ouis import *
-from .serializers_.platforms import *  # changed on the base while this PR was open (1793836260)  # changed on the base while this PR was open (1793843089)
+# changed on the base while this PR was open (1793836260)
+# changed on the base while this PR was open (1793843089)
+from .serializers_.platforms import *
 from .serializers_.power import *
 from .serializers_.racks import *
 from .serializers_.rackunits import *
