@@ -79,6 +79,35 @@ class OUITestCase(TestCase):
         mac_address.delete()
         oui.full_clean()
 
+    def test_prefix_check_skipped_when_unchanged(self):
+        def lookup_queries(oui):
+            with CaptureQueriesContext(connection) as ctx:
+                oui.clean()
+            return [q['sql'] for q in ctx.captured_queries if 'dcim_oui' in q['sql'] or 'dcim_macaddress' in q['sql']]
+
+        mac_address = MACAddress.objects.create(mac_address='00:1B:21:00:00:01')
+
+        # Neither the instance linked on save nor one freshly loaded queries the database while its prefix is unchanged
+        for oui in (mac_address.oui, OUI.objects.get(pk=mac_address.oui_id)):
+            oui.description = 'Unrelated change'
+            self.assertEqual(lookup_queries(oui), [])
+
+        # A deferred prefix is still compared against the stored value
+        oui = OUI.objects.defer('prefix').get(pk=mac_address.oui_id)
+        oui.prefix = '00:1B:22'
+        with self.assertRaises(ValidationError) as cm:
+            oui.clean()
+        self.assertIn('prefix', cm.exception.message_dict)
+
+        # After a saved prefix change, the new prefix is the one compared against
+        mac_address.delete()
+        oui = OUI.objects.get(pk=oui.pk)
+        oui.prefix = '00:1B:22'
+        oui.full_clean()
+        oui.save()
+        MACAddress.objects.create(mac_address='00:1B:22:00:00:01')
+        self.assertEqual(lookup_queries(oui), [])
+
     def test_delete_protected_while_in_use(self):
         mac_address = MACAddress.objects.create(mac_address='00:1B:21:00:00:01')
         with self.assertRaises(ProtectedError):

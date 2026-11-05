@@ -1497,8 +1497,20 @@ class OUI(PrimaryModel):
         verbose_name = _('OUI')
         verbose_name_plural = _('OUIs')
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Denote the original prefix, so that clean() checks for linked MAC addresses only when it has changed
+        self._original_prefix = self.__dict__.get('prefix')
+
     def __str__(self):
         return self.prefix
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        update_fields = kwargs.get('update_fields')
+        if update_fields is None or 'prefix' in update_fields:
+            self._original_prefix = self.prefix
 
     def clean(self):
         super().clean()
@@ -1515,7 +1527,15 @@ class OUI(PrimaryModel):
             })
 
         # MAC addresses are linked by prefix, so changing it would leave them pointing at the wrong OUI
-        if self.pk and self.mac_addresses.exists() and OUI.objects.get(pk=self.pk).prefix != self.prefix:
+        if self.pk and not self._state.adding:
+            original_prefix = self._original_prefix
+            if original_prefix is None:
+                # The prefix was deferred when this instance was loaded
+                original_prefix = OUI.objects.filter(pk=self.pk).values_list('prefix', flat=True).first()
+            prefix_changed = original_prefix != self.prefix
+        else:
+            prefix_changed = False
+        if prefix_changed and self.mac_addresses.exists():
             raise ValidationError({
                 'prefix': _("The prefix cannot be changed while MAC addresses are assigned to this OUI.")
             })
