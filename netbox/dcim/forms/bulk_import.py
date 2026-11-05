@@ -61,6 +61,7 @@ __all__ = (
     'ModuleImportForm',
     'ModuleTypeImportForm',
     'ModuleTypeProfileImportForm',
+    'OUIImportForm',
     'PlatformImportForm',
     'PowerFeedImportForm',
     'PowerOutletImportForm',
@@ -1612,6 +1613,20 @@ class InventoryItemRoleImportForm(OrganizationalModelImportForm):
 #
 # Addressing
 #
+
+class OUIImportForm(PrimaryModelImportForm):
+    manufacturer = CSVModelChoiceField(
+        label=_('Manufacturer'),
+        queryset=Manufacturer.objects.all(),
+        required=False,
+        to_field_name='slug',
+        help_text=_('Manufacturer (slug)')
+    )
+
+    class Meta:
+        model = OUI
+        fields = ['prefix', 'manufacturer', 'description', 'owner', 'comments', 'tags']
+
 
 class MACAddressImportForm(PrimaryModelImportForm):
     device = CSVModelChoiceField(

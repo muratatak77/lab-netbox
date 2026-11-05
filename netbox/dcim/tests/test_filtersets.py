@@ -8962,6 +8962,52 @@ class VirtualDeviceContextTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 0)
 
 
+class OUITestCase(TestCase, ChangeLoggedFilterSetTestMixin):
+    queryset = OUI.objects.all()
+    filterset = OUIFilterSet
+
+    @classmethod
+    def setUpTestData(cls):
+        manufacturers = (
+            Manufacturer(name='Manufacturer 1', slug='manufacturer-1'),
+            Manufacturer(name='Manufacturer 2', slug='manufacturer-2'),
+            Manufacturer(name='Manufacturer 3', slug='manufacturer-3'),
+        )
+        Manufacturer.objects.bulk_create(manufacturers)
+
+        OUI.objects.bulk_create((
+            OUI(prefix='00:00:01', manufacturer=manufacturers[0], description='foobar1'),
+            OUI(prefix='00:00:02', manufacturer=manufacturers[1], description='foobar2'),
+            OUI(prefix='00:00:03', manufacturer=manufacturers[2], description='foobar3'),
+            OUI(prefix='00:00:04'),
+        ))
+
+    def test_q(self):
+        params = {'q': 'foobar1'}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'q': '00:00:02'}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+        params = {'q': 'Manufacturer 3'}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_prefix(self):
+        params = {'prefix': ['00:00:01', '00:00:02']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_description(self):
+        params = {'description': ['foobar1', 'foobar2']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_manufacturer(self):
+        manufacturers = Manufacturer.objects.all()[:2]
+        params = {'manufacturer_id': [manufacturers[0].pk, manufacturers[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'manufacturer': [manufacturers[0].slug, manufacturers[1].slug]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'manufacturer_id': ['null']}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+
 class MACAddressTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
     queryset = MACAddress.objects.all()
     filterset = MACAddressFilterSet
@@ -9038,6 +9084,33 @@ class MACAddressTestCase(TestCase, ChangeLoggedFilterSetTestMixin):
         # Partial matches are not validated
         params = {'mac_address__ic': ['00:00:00:01']}
         self.assertEqual(self.filterset(params, self.queryset).qs.count(), 1)
+
+    def test_oui(self):
+        ouis = (
+            OUI.objects.create(prefix='00:00:11'),
+            OUI.objects.create(prefix='00:00:12'),
+        )
+        MACAddress.objects.create(mac_address='00:00:11:00:00:01')
+        MACAddress.objects.create(mac_address='00:00:12:00:00:01')
+        params = {'oui_id': [ouis[0].pk, ouis[1].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'oui': [ouis[0].prefix, ouis[1].prefix]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+
+    def test_manufacturer(self):
+        manufacturers = (
+            Manufacturer.objects.create(name='NIC Vendor 1', slug='nic-vendor-1'),
+            Manufacturer.objects.create(name='NIC Vendor 2', slug='nic-vendor-2'),
+        )
+        OUI.objects.create(prefix='00:00:11', manufacturer=manufacturers[0])
+        OUI.objects.create(prefix='00:00:12', manufacturer=manufacturers[1])
+        MACAddress.objects.create(mac_address='00:00:11:00:00:01')
+        MACAddress.objects.create(mac_address='00:00:11:00:00:02')
+        MACAddress.objects.create(mac_address='00:00:12:00:00:01')
+        params = {'manufacturer_id': [manufacturers[0].pk]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 2)
+        params = {'manufacturer': [manufacturers[0].slug, manufacturers[1].slug]}
+        self.assertEqual(self.filterset(params, self.queryset).qs.count(), 3)
 
     def test_device(self):
         devices = Device.objects.all()[:2]

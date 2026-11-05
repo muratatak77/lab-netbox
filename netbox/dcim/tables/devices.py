@@ -39,6 +39,7 @@ __all__ = (
     'InventoryItemTable',
     'MACAddressTable',
     'ModuleBayTable',
+    'OUITable',
     'PlatformTable',
     'PowerOutletTable',
     'PowerPortTable',
@@ -1293,10 +1294,46 @@ class MACAddressActionsColumn(columns.ActionsColumn):
         return html
 
 
+class OUITable(PrimaryModelTable):
+    prefix = tables.Column(
+        verbose_name=_('Prefix'),
+        linkify=True
+    )
+    manufacturer = tables.Column(
+        verbose_name=_('Manufacturer'),
+        linkify=True
+    )
+    mac_address_count = columns.LinkedCountColumn(
+        viewname='dcim:macaddress_list',
+        url_params={'oui_id': 'pk'},
+        verbose_name=_('MAC Addresses')
+    )
+    tags = columns.TagColumn(
+        url_name='dcim:oui_list'
+    )
+
+    class Meta(PrimaryModelTable.Meta):
+        model = models.OUI
+        fields = (
+            'pk', 'id', 'prefix', 'manufacturer', 'mac_address_count', 'description', 'comments', 'tags', 'created',
+            'last_updated',
+        )
+        default_columns = ('pk', 'prefix', 'manufacturer', 'mac_address_count', 'description')
+
+
 class MACAddressTable(PrimaryModelTable):
     mac_address = tables.TemplateColumn(
         template_code=MACADDRESS_LINK,
         verbose_name=_('MAC Address')
+    )
+    oui = tables.Column(
+        linkify=True,
+        verbose_name=_('OUI')
+    )
+    manufacturer = tables.Column(
+        accessor=Accessor('oui__manufacturer'),
+        linkify=True,
+        verbose_name=_('Manufacturer')
     )
     assigned_object = tables.Column(
         linkify=True,
@@ -1324,8 +1361,8 @@ class MACAddressTable(PrimaryModelTable):
     class Meta(PrimaryModelTable.Meta):
         model = models.MACAddress
         fields = (
-            'pk', 'id', 'mac_address', 'assigned_object_parent', 'assigned_object', 'description', 'is_primary',
-            'comments', 'tags', 'created', 'last_updated',
+            'pk', 'id', 'mac_address', 'oui', 'manufacturer', 'assigned_object_parent', 'assigned_object',
+            'description', 'is_primary', 'comments', 'tags', 'created', 'last_updated',
         )
         default_columns = (
             'pk', 'mac_address', 'is_primary', 'assigned_object_parent', 'assigned_object', 'description',

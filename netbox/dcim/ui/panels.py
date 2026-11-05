@@ -471,8 +471,16 @@ class VirtualDeviceContextPanel(panels.ObjectAttributesPanel):
     tenant = attrs.RelatedObjectAttr('tenant', linkify=True, grouped_by='group')
 
 
+class OUIPanel(panels.ObjectAttributesPanel):
+    prefix = attrs.TextAttr('prefix', style='font-monospace', copy_button=True)
+    manufacturer = attrs.RelatedObjectAttr('manufacturer', linkify=True)
+    description = attrs.TextAttr('description')
+
+
 class MACAddressPanel(panels.ObjectAttributesPanel):
     mac_address = attrs.TextAttr('mac_address', label=_('MAC address'), style='font-monospace', copy_button=True)
+    oui = attrs.RelatedObjectAttr('oui', label=_('OUI'), linkify=True)
+    manufacturer = attrs.RelatedObjectAttr('manufacturer', linkify=True)
     description = attrs.TextAttr('description')
     assignment = attrs.RelatedObjectAttr('assigned_object', linkify=True, grouped_by='parent_object')
     is_primary = attrs.BooleanAttr('is_primary', label=_('Primary for interface'))

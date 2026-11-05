@@ -50,6 +50,7 @@ These are considered the "core" application models which are used to model netwo
 * [dcim.DeviceType](../models/dcim/devicetype.md)
 * [dcim.Module](../models/dcim/module.md)
 * [dcim.ModuleType](../models/dcim/moduletype.md)
+* [dcim.OUI](../models/dcim/oui.md)
 * [dcim.PowerFeed](../models/dcim/powerfeed.md)
 * [dcim.PowerPanel](../models/dcim/powerpanel.md)
 * [dcim.Rack](../models/dcim/rack.md)

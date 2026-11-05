@@ -18,7 +18,7 @@ from django.utils.translation import gettext_lazy as _
 
 from dcim.choices import *
 from dcim.constants import *
-from dcim.fields import MACAddressField
+from dcim.fields import MACAddressField, OUIField, get_oui_prefix
 from dcim.utils import create_port_mappings, update_interface_bridges, update_interface_parents
 from extras.models import ConfigContextModel, CustomField
 from extras.querysets import ConfigContextModelQuerySet
@@ -38,6 +38,7 @@ from .mixins import RenderConfigMixin
 from .modules import Module
 
 __all__ = (
+    'OUI',
     'Device',
     'DeviceRole',
     'DeviceType',
@@ -1469,9 +1470,89 @@ class VirtualDeviceContext(PrimaryModel):
 # Addressing
 #
 
+class OUI(PrimaryModel):
+    """
+    An organizationally unique identifier (OUI) is the 24-bit prefix of a universally administered MAC address. Records
+    are created automatically as MAC addresses are saved; assigning a manufacturer to one identifies the vendor of every
+    MAC address which shares that prefix.
+    """
+    prefix = OUIField(
+        verbose_name=_('prefix'),
+        max_length=8,
+        unique=True,
+        help_text=_('First three octets of the MAC address (for example, 00:1B:21)')
+    )
+    manufacturer = models.ForeignKey(
+        to='dcim.Manufacturer',
+        on_delete=models.PROTECT,
+        related_name='ouis',
+        blank=True,
+        null=True
+    )
+
+    clone_fields = ('manufacturer',)
+
+    class Meta:
+        ordering = ('prefix',)
+        verbose_name = _('OUI')
+        verbose_name_plural = _('OUIs')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Denote the original prefix, so that clean() checks for linked MAC addresses only when it has changed
+        self._original_prefix = self.__dict__.get('prefix')
+
+    def __str__(self):
+        return self.prefix
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        update_fields = kwargs.get('update_fields')
+        if update_fields is None or 'prefix' in update_fields:
+            self._original_prefix = self.prefix
+
+    def clean(self):
+        super().clean()
+
+        # get_oui_prefix() returns None for anything other than a universally administered unicast address. A malformed
+        # prefix has already been reported by the field's validator, so it is skipped here rather than reported twice.
+        try:
+            non_universal = bool(self.prefix) and get_oui_prefix(f'{self.prefix}:00:00:00') is None
+        except ValidationError:
+            non_universal = False
+        if non_universal:
+            raise ValidationError({
+                'prefix': _("An OUI cannot have the multicast or locally administered bit set.")
+            })
+
+        # MAC addresses are linked by prefix, so changing it would leave them pointing at the wrong OUI
+        if self.pk and not self._state.adding:
+            original_prefix = self._original_prefix
+            if original_prefix is None:
+                # The prefix was deferred when this instance was loaded
+                original_prefix = OUI.objects.filter(pk=self.pk).values_list('prefix', flat=True).first()
+            prefix_changed = original_prefix != self.prefix
+        else:
+            prefix_changed = False
+        if prefix_changed and self.mac_addresses.exists():
+            raise ValidationError({
+                'prefix': _("The prefix cannot be changed while MAC addresses are assigned to this OUI.")
+            })
+
+
 class MACAddress(PrimaryModel):
     mac_address = MACAddressField(
         verbose_name=_('MAC address')
+    )
+    oui = models.ForeignKey(
+        to='dcim.OUI',
+        on_delete=models.PROTECT,
+        related_name='mac_addresses',
+        editable=False,
+        blank=True,
+        null=True,
+        verbose_name=_('OUI')
     )
     assigned_object_type = models.ForeignKey(
         to='contenttypes.ContentType',
@@ -1508,6 +1589,9 @@ class MACAddress(PrimaryModel):
         self._original_assigned_object_id = self.__dict__.get('assigned_object_id')
         self._original_assigned_object_type_id = self.__dict__.get('assigned_object_type_id')
 
+        # Denote the original address, so that save() looks up the OUI only when the address has changed
+        self._original_mac_address = self.__dict__.get('mac_address')
+
     @cached_property
     def is_primary(self):
         # Compare against primary_mac_address_id (a column already loaded on the assigned object) rather than
@@ -1515,6 +1599,26 @@ class MACAddress(PrimaryModel):
         if (obj := self.assigned_object) is not None and hasattr(obj, 'primary_mac_address_id'):
             return obj.primary_mac_address_id == self.pk
         return False
+
+    @property
+    def manufacturer(self):
+        """
+        Return the Manufacturer assigned to this address's OUI, or None if there is no OUI or it has no manufacturer.
+        """
+        return self.oui.manufacturer if self.oui else None
+
+    def save(self, *args, **kwargs):
+        update_fields = normalize_update_fields(kwargs)
+        writes_address = update_fields is None or 'mac_address' in update_fields
+        if writes_address:
+            if self._state.adding or self.oui_id is None or self.mac_address != self._original_mac_address:
+                prefix = get_oui_prefix(self.mac_address)
+                self.oui = OUI.objects.get_or_create(prefix=prefix)[0] if prefix else None
+            if update_fields is not None:
+                kwargs['update_fields'] = update_fields | {'oui'}
+        super().save(*args, **kwargs)
+        if writes_address:
+            self._original_mac_address = self.mac_address
 
     def clean(self, *args, **kwargs):
         super().clean()

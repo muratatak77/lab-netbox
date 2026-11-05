@@ -5859,6 +5859,79 @@ class VirtualDeviceContextBulkDeleteView(generic.BulkDeleteView):
 
 
 #
+# OUIs
+#
+
+@register_model_view(OUI, 'list', path='', detail=False)
+class OUIListView(generic.ObjectListView):
+    queryset = OUI.objects.annotate(
+        mac_address_count=count_related(MACAddress, 'oui')
+    )
+    filterset = filtersets.OUIFilterSet
+    filterset_form = forms.OUIFilterForm
+    table = tables.OUITable
+
+
+@register_model_view(OUI)
+class OUIView(GetRelatedModelsMixin, generic.ObjectView):
+    queryset = OUI.objects.all()
+    template_name = 'generic/object.html'
+    layout = layout.SimpleLayout(
+        left_panels=[
+            panels.OUIPanel(),
+            TagsPanel(),
+            CustomFieldsPanel(),
+        ],
+        right_panels=[
+            RelatedObjectsPanel(),
+            CommentsPanel(),
+        ],
+    )
+
+    def get_extra_context(self, request, instance):
+        return {
+            'related_models': self.get_related_models(request, instance),
+        }
+
+
+@register_model_view(OUI, 'add', detail=False)
+@register_model_view(OUI, 'edit')
+class OUIEditView(generic.ObjectEditView):
+    queryset = OUI.objects.all()
+    form = forms.OUIForm
+
+
+@register_model_view(OUI, 'delete')
+class OUIDeleteView(generic.ObjectDeleteView):
+    queryset = OUI.objects.all()
+
+
+@register_model_view(OUI, 'bulk_import', path='import', detail=False)
+class OUIBulkImportView(generic.BulkImportView):
+    queryset = OUI.objects.all()
+    model_form = forms.OUIImportForm
+
+
+@register_model_view(OUI, 'bulk_edit', path='edit', detail=False)
+class OUIBulkEditView(generic.BulkEditView):
+    queryset = OUI.objects.annotate(
+        mac_address_count=count_related(MACAddress, 'oui')
+    )
+    filterset = filtersets.OUIFilterSet
+    table = tables.OUITable
+    form = forms.OUIBulkEditForm
+
+
+@register_model_view(OUI, 'bulk_delete', path='delete', detail=False)
+class OUIBulkDeleteView(generic.BulkDeleteView):
+    queryset = OUI.objects.annotate(
+        mac_address_count=count_related(MACAddress, 'oui')
+    )
+    filterset = filtersets.OUIFilterSet
+    table = tables.OUITable
+
+
+#
 # MAC addresses
 #
 

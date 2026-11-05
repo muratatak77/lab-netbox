@@ -1,5 +1,6 @@
 from django.contrib.postgres.fields import ArrayField
 from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
 from django.db import models
 from django.utils.translation import gettext as _
 from netaddr import EUI, AddrFormatError, eui64_unix_expanded, mac_unix_expanded
@@ -8,8 +9,10 @@ from .lookups import PathContains
 
 __all__ = (
     'MACAddressField',
+    'OUIField',
     'PathField',
     'WWNField',
+    'get_oui_prefix',
 )
 
 
@@ -56,6 +59,40 @@ class MACAddressField(models.Field):
         return str(self.to_python(value))
 
 
+class OUIField(models.CharField):
+    """
+    The first three octets of a MAC address, always stored as colon-separated uppercase hexadecimal (AA:BB:CC). Hyphens
+    and lowercase digits are also accepted on input, as REST API serializers validate a value before it is normalized.
+    """
+    description = 'Organizationally unique identifier'
+    default_validators = [
+        RegexValidator(
+            regex=r'^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){2}$',
+            message=_("Enter three hexadecimal octets (for example, 00:1B:21)."),
+        ),
+    ]
+
+    @staticmethod
+    def normalize(value):
+        """
+        Return the value stripped, uppercased and colon-separated (AA:BB:CC).
+        """
+        return value.strip().upper().replace('-', ':')
+
+    def to_python(self, value):
+        value = super().to_python(value)
+        return value if value is None else self.normalize(value)
+
+    def get_prep_value(self, value):
+        value = super().get_prep_value(value)
+        return value if value is None else self.normalize(value)
+
+    def pre_save(self, model_instance, add):
+        value = self.to_python(super().pre_save(model_instance, add))
+        setattr(model_instance, self.attname, value)
+        return value
+
+
 class WWNField(models.Field):
     description = 'World Wide Name field'
 
@@ -95,3 +132,16 @@ class PathField(ArrayField):
 
 
 PathField.register_lookup(PathContains)
+
+
+#
+# Utilities
+#
+
+def get_oui_prefix(mac_address):
+    """
+    Return the OUI portion (AA:BB:CC) of a MAC address, or None if the address does not carry one: locally administered
+    and multicast addresses are identified by the two lowest bits of the first octet.
+    """
+    prefix = str(MACAddressField().to_python(mac_address))[:8]
+    return None if int(prefix[:2], 16) & 0b11 else prefix

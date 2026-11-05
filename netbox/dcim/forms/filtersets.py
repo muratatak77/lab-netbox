@@ -67,6 +67,7 @@ __all__ = (
     'ModuleFilterForm',
     'ModuleTypeFilterForm',
     'ModuleTypeProfileFilterForm',
+    'OUIFilterForm',
     'PlatformFilterForm',
     'PowerConnectionFilterForm',
     'PowerFeedFilterForm',
@@ -2448,11 +2449,31 @@ class InventoryItemRoleFilterForm(OrganizationalModelFilterSetForm):
 # Addressing
 #
 
+class OUIFilterForm(PrimaryModelFilterSetForm):
+    model = OUI
+    fieldsets = (
+        FieldSet('q', 'filter_id', 'tag'),
+        FieldSet('prefix', 'manufacturer_id', name=_('Attributes')),
+        FieldSet('owner_group_id', 'owner_id', name=_('Ownership')),
+    )
+    prefix = forms.CharField(
+        required=False,
+        label=_('Prefix'),
+    )
+    manufacturer_id = DynamicModelMultipleChoiceField(
+        queryset=Manufacturer.objects.all(),
+        required=False,
+        null_option='None',
+        label=_('Manufacturer'),
+    )
+    tag = TagFilterField(model)
+
+
 class MACAddressFilterForm(PrimaryModelFilterSetForm):
     model = MACAddress
     fieldsets = (
         FieldSet('q', 'filter_id', 'tag'),
-        FieldSet('mac_address', name=_('Attributes')),
+        FieldSet('mac_address', 'oui_id', 'manufacturer_id', name=_('Attributes')),
         FieldSet('device_id', 'virtual_machine_id', 'assigned', 'primary', name=_('Assignments')),
         FieldSet('owner_group_id', 'owner_id', name=_('Ownership')),
     )
@@ -2460,6 +2481,16 @@ class MACAddressFilterForm(PrimaryModelFilterSetForm):
     mac_address = forms.CharField(
         required=False,
         label=_('MAC address'),
+    )
+    oui_id = DynamicModelMultipleChoiceField(
+        queryset=OUI.objects.all(),
+        required=False,
+        label=_('OUI'),
+    )
+    manufacturer_id = DynamicModelMultipleChoiceField(
+        queryset=Manufacturer.objects.all(),
+        required=False,
+        label=_('Manufacturer'),
     )
     device_id = DynamicModelMultipleChoiceField(
         queryset=Device.objects.all(),

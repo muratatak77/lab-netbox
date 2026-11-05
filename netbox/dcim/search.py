@@ -157,6 +157,17 @@ class FrontPortIndex(SearchIndex):
 
 
 @register_search
+class OUIIndex(SearchIndex):
+    model = models.OUI
+    fields = (
+        ('prefix', 100),
+        ('description', 500),
+        ('comments', 5000),
+    )
+    display_attrs = ('manufacturer', 'description')
+
+
+@register_search
 class MACAddressIndex(SearchIndex):
     model = models.MACAddress
     fields = (

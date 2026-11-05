@@ -10,6 +10,10 @@ Most physical interfaces have only a single MAC address, hard-coded at the facto
 
 The 48-bit MAC address, expressed in colon-hexadecimal notation (for example, `aa:bb:cc:11:22:33`).
 
+### OUI
+
+The [OUI](./oui.md) corresponding to the first three octets of the address, which identifies its manufacturer if one has been assigned to the OUI. NetBox sets this automatically when the MAC address is saved. Locally administered and multicast addresses have no OUI.
+
 ### Assigned Object
 
 A generic reference to the [device interface](./interface.md) or [virtual machine interface](../virtualization/vminterface.md) to which this MAC address is assigned. A MAC address may exist without being assigned to any interface.

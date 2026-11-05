@@ -29,6 +29,166 @@ from utilities.testing import create_test_device, create_test_image
 from virtualization.models import Cluster, ClusterType
 
 
+class OUITestCase(TestCase):
+
+    def test_prefix_normalized(self):
+        oui = OUI(prefix='00-1b-21')
+        oui.full_clean()
+        self.assertEqual(oui.prefix, '00:1B:21')
+
+        oui = OUI.objects.create(prefix='00-1b-22')
+        self.assertEqual(oui.prefix, '00:1B:22')
+        self.assertTrue(OUI.objects.filter(prefix='00:1b:22').exists())
+
+    def test_duplicate_prefix_rejected_in_any_notation(self):
+        OUI.objects.create(prefix='00:1B:21')
+        with self.assertRaises(ValidationError) as cm:
+            OUI(prefix='00-1b-21').full_clean()
+        self.assertIn('prefix', cm.exception.message_dict)
+
+    def test_invalid_prefix(self):
+        for prefix in ('00:1B', '00:1B:21:00', '00:1B:ZZ', '001B21'):
+            with self.subTest(prefix=prefix), self.assertRaises(ValidationError):
+                OUI(prefix=prefix).full_clean()
+
+    def test_malformed_prefix_reported_once(self):
+        with self.assertRaises(ValidationError) as cm:
+            OUI(prefix='00:1B:ZZ').full_clean()
+        self.assertEqual(list(cm.exception.message_dict), ['prefix'])
+        self.assertEqual(len(cm.exception.message_dict['prefix']), 1)
+
+    def test_non_universal_prefix_rejected(self):
+        for prefix in ('01:00:5E', '02:00:00', 'FF:FF:FF'):
+            with self.subTest(prefix=prefix), self.assertRaises(ValidationError) as cm:
+                OUI(prefix=prefix).full_clean()
+            self.assertIn('prefix', cm.exception.message_dict)
+
+    def test_prefix_immutable_while_in_use(self):
+        mac_address = MACAddress.objects.create(mac_address='00:1B:21:00:00:01')
+        oui = mac_address.oui
+
+        oui.description = 'Unrelated change'
+        oui.full_clean()
+
+        oui.prefix = '00:1B:22'
+        with self.assertRaises(ValidationError) as cm:
+            oui.full_clean()
+        self.assertIn('prefix', cm.exception.message_dict)
+
+        # With nothing linked to it, the OUI can be corrected
+        mac_address.delete()
+        oui.full_clean()
+
+    def test_prefix_check_skipped_when_unchanged(self):
+        def lookup_queries(oui):
+            with CaptureQueriesContext(connection) as ctx:
+                oui.clean()
+            return [q['sql'] for q in ctx.captured_queries if 'dcim_oui' in q['sql'] or 'dcim_macaddress' in q['sql']]
+
+        mac_address = MACAddress.objects.create(mac_address='00:1B:21:00:00:01')
+
+        # Neither the instance linked on save nor one freshly loaded queries the database while its prefix is unchanged
+        for oui in (mac_address.oui, OUI.objects.get(pk=mac_address.oui_id)):
+            oui.description = 'Unrelated change'
+            self.assertEqual(lookup_queries(oui), [])
+
+        # A deferred prefix is still compared against the stored value
+        oui = OUI.objects.defer('prefix').get(pk=mac_address.oui_id)
+        oui.prefix = '00:1B:22'
+        with self.assertRaises(ValidationError) as cm:
+            oui.clean()
+        self.assertIn('prefix', cm.exception.message_dict)
+
+        # After a saved prefix change, the new prefix is the one compared against
+        mac_address.delete()
+        oui = OUI.objects.get(pk=oui.pk)
+        oui.prefix = '00:1B:22'
+        oui.full_clean()
+        oui.save()
+        MACAddress.objects.create(mac_address='00:1B:22:00:00:01')
+        self.assertEqual(lookup_queries(oui), [])
+
+    def test_delete_protected_while_in_use(self):
+        mac_address = MACAddress.objects.create(mac_address='00:1B:21:00:00:01')
+        with self.assertRaises(ProtectedError):
+            mac_address.oui.delete()
+
+
+class MACAddressOUITestCase(TestCase):
+
+    def test_linked_on_save(self):
+        mac_address = MACAddress.objects.create(mac_address='00:1b:21:00:00:01')
+        self.assertEqual(mac_address.oui.prefix, '00:1B:21')
+        self.assertIsNone(mac_address.manufacturer)
+
+        # A second address sharing the prefix reuses the OUI
+        other = MACAddress.objects.create(mac_address='00-1B-21-00-00-02')
+        self.assertEqual(other.oui, mac_address.oui)
+        self.assertEqual(OUI.objects.count(), 1)
+
+    def test_manufacturer(self):
+        manufacturer = Manufacturer.objects.create(name='Intel', slug='intel')
+        OUI.objects.create(prefix='00:1B:21', manufacturer=manufacturer)
+
+        mac_address = MACAddress.objects.create(mac_address='00:1B:21:00:00:01')
+        self.assertEqual(mac_address.manufacturer, manufacturer)
+
+    def test_locally_administered_and_multicast_have_no_oui(self):
+        for address in ('02:00:00:00:00:01', 'AA:BB:CC:00:00:01', '01:00:5E:00:00:01'):
+            with self.subTest(address=address):
+                self.assertIsNone(MACAddress.objects.create(mac_address=address).oui)
+        self.assertFalse(OUI.objects.exists())
+
+    def test_relinked_when_address_changes(self):
+        mac_address = MACAddress.objects.create(mac_address='00:1B:21:00:00:01')
+
+        mac_address.mac_address = '00:1B:22:00:00:01'
+        mac_address.save()
+        mac_address.refresh_from_db()
+        self.assertEqual(mac_address.oui.prefix, '00:1B:22')
+
+        mac_address.mac_address = '02:00:00:00:00:01'
+        mac_address.save()
+        mac_address.refresh_from_db()
+        self.assertIsNone(mac_address.oui)
+
+    def test_update_fields(self):
+        mac_address = MACAddress.objects.create(mac_address='00:1B:21:00:00:01')
+
+        mac_address.mac_address = '00:1B:22:00:00:01'
+        mac_address.save(update_fields=['mac_address'])
+        mac_address.refresh_from_db()
+        self.assertEqual(mac_address.oui.prefix, '00:1B:22')
+
+        # A save which doesn't write the address must leave the OUI in step with what's in the database
+        mac_address.mac_address = '00:1B:23:00:00:01'
+        mac_address.save(update_fields=['description'])
+        mac_address.refresh_from_db()
+        self.assertEqual(mac_address.oui.prefix, '00:1B:22')
+
+    def test_oui_not_looked_up_when_address_unchanged(self):
+        def oui_queries(instance):
+            with CaptureQueriesContext(connection) as ctx:
+                instance.save()
+            return [q['sql'] for q in ctx.captured_queries if 'dcim_oui' in q['sql']]
+
+        mac_address = MACAddress.objects.create(mac_address='00:1B:21:00:00:01')
+        oui = mac_address.oui
+
+        # Neither an instance just saved nor one freshly loaded looks up the OUI again
+        mac_address.description = 'Unrelated change'
+        self.assertEqual(oui_queries(mac_address), [])
+        mac_address = MACAddress.objects.get(pk=mac_address.pk)
+        mac_address.description = 'Another change'
+        self.assertEqual(oui_queries(mac_address), [])
+        self.assertEqual(mac_address.oui, oui)
+
+        # Changing the address still relinks it
+        mac_address.mac_address = '00:1B:22:00:00:01'
+        self.assertNotEqual(oui_queries(mac_address), [])
+        self.assertEqual(mac_address.oui.prefix, '00:1B:22')
+
+
 class MACAddressTestCase(TestCase):
     @classmethod
     def setUpTestData(cls):
