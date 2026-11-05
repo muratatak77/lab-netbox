@@ -132,3 +132,4 @@ NetBox's functionality can be extended through plugins, which add new models, vi
   <strong>Cable Trace</strong><br />
   <img src="docs/media/screenshots/cable-trace.png" width="600" alt="Cable trace" />
 </p>
+
