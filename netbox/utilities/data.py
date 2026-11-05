@@ -322,3 +322,5 @@ def resolve_attr_path(obj, path):
         except AttributeError:
             cur = None
     return cur
+
+# Lab note.
